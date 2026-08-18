@@ -39,9 +39,12 @@ _LOAD_T0 = 0.0
 
 def _kernel_caps():
     """omni_xpu_kernel 可用算子检测（kernel 分 A/B 版、更新频繁，加载时探测）。"""
-    caps = {"s8u4": False, "int4": False, "tint4": False}
+    caps = {"w4a4": False, "s8u4": False, "int4": False, "tint4": False}
     try:
         from omni_xpu_kernel import svdq
+        # w4a4 预留：kernel 已有 w4a4_gemm_esimd，但层间 INT4 激活传递未实现，
+        # 达成前保持 False，加载时自动逐级回退 w4a8 → w4a16。
+        caps["w4a4"] = False
         caps["s8u4"] = hasattr(svdq, "onednn_s8u4_gemm")
         caps["int4"] = (
             hasattr(svdq, "onednn_int4_gemm_preconverted")
@@ -51,6 +54,34 @@ def _kernel_caps():
     except Exception:
         pass
     return caps
+
+
+_BACKEND_CHAIN = {
+    "w4a4": ("w4a4", "w4a8", "w4a16"),
+    "w4a8": ("w4a8", "w4a16"),
+    "w4a16": ("w4a16",),
+}
+
+
+def _resolve_backend(requested, caps):
+    """逐级回退：w4a4 → w4a8 → w4a16（kernel 缺失时逐级降级）。
+    w4a16 恒可达（wa4 走纯 python / tint4 走 torchao 兜底）。
+    未来 w4a4 层间 INT4 传递实现后，把 caps['w4a4'] 置 True 即自动启用。"""
+    req = requested if requested in _BACKEND_CHAIN else "w4a16"
+    for cand in _BACKEND_CHAIN[req]:
+        if cand == "w4a4":
+            if caps.get("w4a4"):
+                return cand
+            log.warning("[wa4] w4a4 backend 未就绪（层间 INT4 激活传递未实现），逐级回退 w4a8")
+            continue
+        if cand == "w4a8":
+            if caps["s8u4"]:
+                return cand
+            log.warning("[wa4] a8 kernel 不可用（onednn_s8u4_gemm 缺失），自动回退 w4a16")
+            continue
+        if cand == "w4a16":
+            return cand
+    return "w4a16"
 
 
 class Int4LinearPython(nn.Module):
@@ -1503,20 +1534,17 @@ class wa4ModelLoader:
             log.info("[wa4] Converted %d FP8 tensors → %s", len(fp8_keys), weight_dtype)
             _ram_trace("fp8 converted")
 
-        # ── 融合回退阶梯：a8 → a16 → python / torchao ──
-        # kernel 分 A/B 版且更新频繁，这里在加载时探测实际可用算子：
-        #   w4a8 无 onednn_s8u4_gemm → 回退 w4a16；
-        #   w4a16 无对应 kernel → wa4 模型回退纯 python 反量化，
-        #                            tint4 模型回退 torchao。
+        # ── 融合回退阶梯：w4a4 → w4a8 → w4a16 → python / torchao ──
+        # kernel 分 A/B 版且更新频繁，这里在加载时探测实际可用算子并逐级回退：
+        #   w4a4（预留）→ w4a8（onednn_s8u4_gemm）→ w4a16（int4/tint4 kernel）
+        #   → wa4 模型纯 python 反量化 / tint4 模型 torchao。
         caps = _kernel_caps()
         is_tint4 = (
             sd.get("__tint4_format__") is not None
             or sd.get("__tint4_group_size__") is not None
         )
         _mode = "kernel"  # kernel 原生（wa4 或 tint4）
-        if backend == "w4a8" and not caps["s8u4"]:
-            log.warning("[wa4] a8 kernel 不可用（onednn_s8u4_gemm 缺失），自动回退 w4a16")
-            backend = "w4a16"
+        backend = _resolve_backend(backend, caps)
         if backend == "w4a16":
             if is_tint4:
                 if caps["tint4"]:

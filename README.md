@@ -28,8 +28,9 @@ oneDNN INT4 GEMM 家族加速（A770/DG2 XPU）。
 加载时按 `omni_xpu_kernel` 实际可用算子自动选择：
 
 ```
-请求 w4a8
-  └─ onednn_s8u4_gemm 缺失 → 回退 w4a16
+请求 w4a4 / w4a8
+  └─ 逐级回退：w4a4（层间 INT4 传递未实现，预留）→ w4a8（onednn_s8u4_gemm）
+       → w4a16
 请求/回退到 w4a16
   ├─ wa4 模型：onednn_int4_gemm(_preconverted) 缺失 → 纯 python 反量化
   └─ tint4 模型：onednn_int4_gemm_tint4 缺失
