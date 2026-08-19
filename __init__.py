@@ -31,4 +31,6 @@ from .int4_xpu_lora_stack import NODE_CLASS_MAPPINGS as _LS, NODE_DISPLAY_NAME_M
 NODE_CLASS_MAPPINGS = {**_L, **_Q, **_LR, **_LS}
 NODE_DISPLAY_NAME_MAPPINGS = {**_LD, **_QD, **_LRD, **_LSD}
 
+__version__ = "1.0"
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

@@ -247,7 +247,7 @@ class int4XPUModelQuantizer:
 	RETURN_TYPES = ()
 	FUNCTION = "quantize"
 	CATEGORY = "int4"
-	TITLE = "INT4XPU Model Quantizer v1.0"
+	TITLE = "INT4XPU Model Quantizer"
 	OUTPUT_NODE = True
 
 	def quantize(self, unet_name, model_type, output_filename, device,
@@ -344,4 +344,4 @@ class int4XPUModelQuantizer:
 
 
 NODE_CLASS_MAPPINGS = {"int4XPUModelQuantizer": int4XPUModelQuantizer}
-NODE_DISPLAY_NAME_MAPPINGS = {"int4XPUModelQuantizer": "INT4XPU Model Quantizer v1.0"}
+NODE_DISPLAY_NAME_MAPPINGS = {"int4XPUModelQuantizer": "INT4XPU Model Quantizer"}

@@ -1,18 +1,11 @@
 """
-INT4XPU Model Loader v1.4.2n — omni_xpu_kernel.svdq oneDNN INT4 GEMM via XMX engine.
+INT4XPU Model Loader v1.0 — omni_xpu_kernel.svdq oneDNN INT4 GEMM via XMX engine.
 Pre-injection + FP8转换 + dtype 按文件标记 + omni norm V3 + QuaRot + LoRA + 显存释放。
 
-v1.4.2n（实验A）：探针无条件安装（AIMDO active 也装，原版 reset+sync 机制）；
-  其余（patch_aimdo_xpu / Krea2 常驻 / detach 释放）让路逻辑全保留。
-v1.4.3（AIMDO 全权接管）：
-  - 移除 QW attention 探针（reset_peak+sync，不再强制同步）。
-  - 显存策略全部按 aimdo_active() 让路：AIMDO 接管时 wa4 不做
-    release_xpu / synchronize / empty_cache；未启用 AIMDO 时保留原兜底。
-  - 保留设备放置（forward 惰性 .to(dev)，AIMDO 管不到）；
-    release_xpu 补上 _w_s8。
-v1.4.2m:
-  - + QW attention 探针（'Attention' 子串匹配 + reset/sync/peak）——实证 12.5GB 不溢出
-  - + Krea2 常驻 GPU + AIMDO 让路
+v1.0（正式版首发）：
+  - wa4 / tint4（torchao）统一加载，w4a16（kernel → converted → torchao / python 回退）。
+  - LoRA 全路径生效（kernel / torchao / python，含融合 QKV 切片）。
+  - a8 / a4 开发中（界面隐藏，源码路径保留）。
 """
 import gc, os, time, types, torch, torch.nn as nn, torch.nn.functional as F, comfy.ops, comfy.utils
 import comfy.model_detection, comfy.sd, folder_paths, logging
@@ -1566,7 +1559,7 @@ class int4XPUModelLoader:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_model"
     CATEGORY = "int4"
-    TITLE = "INT4XPU Model Loader v1.4.2n"
+    TITLE = "INT4XPU Model Loader"
 
     def load_model(self, unet_name, backend="w4a16"):
         global _LOAD_T0
@@ -1860,7 +1853,7 @@ class int4XPUModelLoader:
 
 
 NODE_CLASS_MAPPINGS = {"int4XPUModelLoader": int4XPUModelLoader}
-NODE_DISPLAY_NAME_MAPPINGS = {"int4XPUModelLoader": "INT4XPU Model Loader v1.4.2n"}
+NODE_DISPLAY_NAME_MAPPINGS = {"int4XPUModelLoader": "INT4XPU Model Loader"}
 
 
 # ── 调试：捕获 QW 模型首次前向的真实输入（OMNIXPU_INT4_DUMP_FWD=路径）──
