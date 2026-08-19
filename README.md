@@ -36,6 +36,18 @@ kernel 分 A/B 两个系列，按你的平台选对应的仓库编译 wheel 后�
 - 本插件对 A/B 无感知：加载时探测 kernel 里实际存在的算子，有就调用、
   没有就安全回退。
 
+### torchao-xpu 依赖（插件自动安装）
+
+**torchao** 是 INT4 非对称量化格式（`Int4PlainInt32Tensor`）的后端实现，
+也是 tint4/torchao 格式模型**无 kernel 时的回退运行路径**。插件启动时会
+自动检测：本插件需要的 torchao 缺失或过旧时，自动执行
+`pip install torchao --isolated --index-url https://download.pytorch.org/whl/xpu`
+（与 tint4 原插件同款机制）。
+
+目的：**保证 tint4 模型即使在没有 kernel（或 kernel 缺算子）的机器上也能
+直接加载运行**，不要求用户手动装 torchao。有 kernel 时原生加速、无需
+torchao；无 kernel 时自动回退到 torchao 路径，功能完整、速度较慢。
+
 ## 模型下载
 
 已量化的可用模型（INT4）：
