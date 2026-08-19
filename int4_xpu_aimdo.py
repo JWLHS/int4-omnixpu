@@ -16,7 +16,7 @@ v1.1:
 import logging
 import torch
 
-log = logging.getLogger("WA4-AIMDO")
+log = logging.getLogger("int4-AIMDO")
 
 _orig_cuda_sync = getattr(torch.cuda, "synchronize", None)
 _noop_sync = lambda *a, **k: None

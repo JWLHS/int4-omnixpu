@@ -59,14 +59,14 @@ class INT4XPULoRAStack:
             if n is None or n == "None" or n == "": continue
             if abs(s) < 1e-5: continue
             p = folder_paths.get_full_path("loras", n)
-            if p is None: log.warning(f"[WA4 Stack] '{n}' not found"); continue
+            if p is None: log.warning(f"[int4 Stack] '{n}' not found"); continue
             to_apply.append((n, p, s))
 
         if getattr(model.model, '_wa4_lora_needs_reset', False):
             _wa4_reset_all_loras(model)
             object.__setattr__(model.model, '_wa4_lora_needs_reset', False)
         if not to_apply:
-            log.info("[WA4 Stack] ✓ no active LoRAs")
+            log.info("[int4 Stack] ✓ no active LoRAs")
             return (model,)
 
         base_model = model.model
@@ -139,7 +139,7 @@ class INT4XPULoRAStack:
             parts = []
             if aq: parts.append(f"{aq}q")
             if ab: parts.append(f"{ab}b")
-            log.info("[WA4 Stack] %s | %s | s=%.2f | %.2fs%s",
+            log.info("[int4 Stack] %s | %s | s=%.2f | %.2fs%s",
                      lora_name, "+".join(parts) if parts else "0", strength, elapsed,
                      f" | {unmatched}u" if unmatched else "")
             total_aq += aq; total_ab += ab
@@ -149,7 +149,7 @@ class INT4XPULoRAStack:
             model.model._wa4_loras.append({"name": lora_name, "strength": strength, "path": lora_path})
             del lora_sd, lora_data
 
-        log.info("[WA4 Stack] ✓ %d LoRAs | %dq+%db | %.2fs",
+        log.info("[int4 Stack] ✓ %d LoRAs | %dq+%db | %.2fs",
                  len(to_apply), total_aq, total_ab, time.perf_counter() - total_t0)
         return (model,)
 

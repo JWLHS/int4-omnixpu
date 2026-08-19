@@ -210,5 +210,5 @@ def _wa4_reset_all_loras(model) -> None:
         bs.pop('_pending', None)
         bs.clear()
     object.__setattr__(model.model, '_wa4_loras', [])
-    log.info("[WA4 LoRA] All LoRA entries cleared")
+    log.info("[int4 LoRA] All LoRA entries cleared")
 

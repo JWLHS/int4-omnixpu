@@ -288,7 +288,7 @@ def _tphase(name, mark=None):
         _LOAD_T0 = now
     if mark is None:
         mark = _LOAD_T0
-    log.info("[wa4-timing] %s: %.2fs (total %.2fs)", name, now - mark, now - _LOAD_T0)
+    log.info("[int4-timing] %s: %.2fs (total %.2fs)", name, now - mark, now - _LOAD_T0)
     return now
 
 
@@ -1285,7 +1285,7 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
         n = len(_gpu_conv)
         _gpu_conv.clear()
         if _TIMING:
-            log.info("[wa4-timing] tint4 d2h flush: %.2fs (%d layers)",
+            log.info("[int4-timing] tint4 d2h flush: %.2fs (%d layers)",
                      time.time() - _tc1, n)
 
     for key in list(sd.keys()):
@@ -1372,7 +1372,7 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
         pass
     _tphase("index_int4 done", _t0)
     if _TIMING and _n_conv:
-        log.info("[wa4-timing] tint4 conversions: %d layers, wall %.2fs (avg %.3fs)",
+        log.info("[int4-timing] tint4 conversions: %d layers, wall %.2fs (avg %.3fs)",
                  _n_conv, _t_conv, _t_conv / _n_conv)
     log.info("[int4] Indexed %d INT4 groups", len(quant))
     return quant
@@ -1691,14 +1691,14 @@ class int4XPUModelLoader:
                 _ok = _aimdo_ctl.empty_xpu_allocator_cache(wait=True)
                 if _TIMING:
                     log.info(
-                        "[wa4-timing] aimdo empty after tint4 conv -> ok=%s total=%.0fMB",
+                        "[int4-timing] aimdo empty after tint4 conv -> ok=%s total=%.0fMB",
                         _ok, _aimdo_ctl.get_total_vram_usage() / (1024 ** 2),
                     )
             else:
                 torch.xpu.synchronize()
                 torch.xpu.empty_cache()
                 if _TIMING:
-                    log.info("[wa4-timing] xpu.empty_cache after tint4 conv")
+                    log.info("[int4-timing] xpu.empty_cache after tint4 conv")
         except Exception as _e:
             log.warning("[int4] tint4 conv cache release failed: %r", _e)
 

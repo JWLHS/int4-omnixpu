@@ -98,13 +98,13 @@ def _make_bake_pre_hook(module: nn.Module):
                                     base_sl + (i + 1) * target_rows)
                         w_new[seg] += delta_gpu[i * target_rows:(i + 1) * target_rows]
                 else:
-                    log.warning(f"[WA4 LoRA] shape mismatch delta={tuple(delta_gpu.shape)} "
+                    log.warning(f"[int4 LoRA] shape mismatch delta={tuple(delta_gpu.shape)} "
                                 f"target={tuple(module.weight.shape)} — skip")
                     continue
                 applied.append((delta_gpu.to(device=cpu, dtype=torch.float16).clone(), sl, se))
             module.weight = nn.Parameter(w_new)   # 换新权重（AIMDO 分配），原页由 AIMDO 回收
         except Exception as e:
-            log.warning("[WA4 LoRA] bake pre-hook failed: %s", e)
+            log.warning("[int4 LoRA] bake pre-hook failed: %s", e)
         bs.pop('_pending', None)
         bs['_applied'] = applied
         hh = bs.pop('_hook_handle', None)
@@ -152,7 +152,7 @@ class INT4XPULoRALoader:
 
         lora_path = folder_paths.get_full_path("loras", lora_name)
         if lora_path is None:
-            raise FileNotFoundError(f"[WA4 LoRA] '{lora_name}' not found")
+            raise FileNotFoundError(f"[int4 LoRA] '{lora_name}' not found")
 
         base_model = model.model
         while hasattr(base_model, '_orig_mod'): base_model = base_model._orig_mod
@@ -222,7 +222,7 @@ class INT4XPULoRALoader:
         if aq: parts.append(f"{aq} quant")
         if ab: parts.append(f"{ab} bake")
         if aq == 0 and ab == 0: parts = ["0 layers"]
-        log.info("[WA4 LoRA] ✓ %s | %s | strength=%s | %.2fs%s",
+        log.info("[int4 LoRA] ✓ %s | %s | strength=%s | %.2fs%s",
                  lora_name, " + ".join(parts), strength, elapsed,
                  f" | {unmatched} unmatched" if unmatched else "")
 
