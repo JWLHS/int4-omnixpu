@@ -132,6 +132,9 @@ def _fix_mps():
 
 def ensure_installed(force: bool = False) -> bool:
     """返回 True 表示依赖就绪（无需重启前重试标记）。"""
+    if os.environ.get("OMNIXPU_INT4_NO_AUTO_INSTALL", "0") != "0":
+        # 手动管理依赖时跳过自动安装（测试/离线场景）。
+        return check_installed() is None
     if not force and check_installed() is None:
         return True
     device = detect_device()

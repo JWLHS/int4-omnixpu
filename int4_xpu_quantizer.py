@@ -149,7 +149,7 @@ _EXCLUSIONS = {
 		"x_embedder", "final_layer",
 	],
 	"h3": [
-		"adaln_proj", "video_patch_proj", "audio_patch_proj",
+		"video_patch_proj", "audio_patch_proj",
 		"condition_proj", "final_layer", "time_embedder", "time_embed",
 	],
 	"auto": [],

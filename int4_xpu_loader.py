@@ -95,7 +95,11 @@ def _resolve_backend(requested, caps):
 
 
 class Int4LinearPython(nn.Module):
-    """wa4 格式在无 omnixpu kernel 时的纯 python 回退：一次性反量化 + F.linear。"""
+    """wa4 格式在无 omnixpu kernel 时的纯 python 回退：逐层反量化 + F.linear。
+
+    注意：反量化结果不跨 forward 缓存（用完即弃），否则 224 层 fp16 权重
+    全部驻留会把 8GB+ 的 int4 模型撑爆显存（OOM）。回退本来就慢，优先保内存。
+    """
 
     def __init__(self, in_features, out_features, packed, scale, group_size,
                  bias=None, act_dtype=torch.float16, use_quarot=False,
@@ -111,7 +115,6 @@ class Int4LinearPython(nn.Module):
         self._use_quarot = use_quarot
         self._hadamard_H = hadamard_H
         self._quarot_gs = quarot_gs or group_size
-        object.__setattr__(self, "_w", None)  # 反量化权重缓存
         object.__setattr__(self, "_wa4_lora_entries", None)
 
     def _dequant(self, dev):
@@ -138,9 +141,9 @@ class Int4LinearPython(nn.Module):
                 x2 = rotate_activation(x2, self._hadamard_H, self._quarot_gs)
             except Exception:
                 pass
-        if self._w is None or self._w.device != dev:
-            object.__setattr__(self, "_w", self._dequant(dev))
-        out = F.linear(x2, self._w)
+        w = self._dequant(dev)  # 局部反量化，forward 结束即释放
+        out = F.linear(x2, w)
+        del w
         if self.bias is not None:
             out = out + self.bias.to(device=dev, dtype=out.dtype)
         return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -175,18 +178,39 @@ class Int4LinearTorchao(nn.Module):
                 x2 = rotate_activation(x2, self._hadamard_H, self._quarot_gs)
             except Exception:
                 pass
-        if self._qt is None or getattr(self._qt, "device", None) != dev:
-            from torchao.quantization.quantize_.workflows.int4.int4_plain_int32_tensor import (
-                Int4PlainInt32Tensor,
-            )
-            self._qt = Int4PlainInt32Tensor(
-                self._qdata.to(dev), self._scale.to(dev), self._zp.to(dev),
-                self._gs, [self.out_features, self.in_features],
-            )
-        out = F.linear(x2, self._qt, None)
+        try:
+            if self._qt is None or getattr(self._qt, "device", None) != dev:
+                from torchao.quantization.quantize_.workflows.int4.int4_plain_int32_tensor import (
+                    Int4PlainInt32Tensor,
+                )
+                self._qt = Int4PlainInt32Tensor(
+                    self._qdata.to(dev), self._scale.to(dev), self._zp.to(dev),
+                    self._gs, [self.out_features, self.in_features],
+                )
+            out = F.linear(x2, self._qt, None)
+        except Exception as _tao_e:
+            # torchao 缺失/过旧时的纯 python 回退：
+            # 解包 nibbles -> w = (q - zp) * scale -> F.linear。
+            w = self._python_dequant(dev)
+            out = F.linear(x2, w)
         if self.bias is not None:
             out = out + self.bias.to(device=dev, dtype=out.dtype)
         return out.reshape(*x.shape[:-1], out.shape[-1])
+
+    def _python_dequant(self, dev):
+        """tint4 int32 qdata -> [N, K] 权重 = (q - zp) * scale（纯 python）。"""
+        qdata = self._qdata.to(dev)
+        N, K8 = qdata.shape
+        K = K8 * 8
+        b = qdata.view(torch.uint8)  # [N, K/2]，小端 2 nibble/byte
+        lo = (b & 0x0F).to(torch.int32)
+        hi = ((b >> 4) & 0x0F).to(torch.int32)
+        q = torch.stack([lo, hi], dim=-1).reshape(N, K)  # [N, K] u4
+        G = self._zp.shape[0]
+        gs = self._gs
+        z = self._zp.to(dev).float().t().unsqueeze(-1).expand(N, G, gs).reshape(N, K)
+        s = self._scale.to(dev).float().t().unsqueeze(-1).expand(N, G, gs).reshape(N, K)
+        return ((q - z) * s).to(self._act_dtype)
 
 
 def _tphase(name, mark=None):
