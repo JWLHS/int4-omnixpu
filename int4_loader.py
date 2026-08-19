@@ -751,11 +751,12 @@ class wa4Linear(nn.Module):
         # （__w4a4_quarot_group_size__，通常 128）是两个概念，分开存储。
         object.__setattr__(self, "_group_size", group_size)
         # 激活量化分组：a8 下 src 侧 oneDNN 只稳定支持 32/64；
-        # tint4 权重 gs=128 时激活仍按 64 量化（src/wei 分组解耦）。
+        # 权重 gs>64（如 tint4 gs=128）时激活按 64 量化，
+        # kernel 的 onednn_s8u4_gemm 已支持 src/wei 分组解耦。
+        _g = group_size or 64
         object.__setattr__(
             self, "_act_gs",
-            64 if (bool(tint4_mode) and backend in ("w4a8", "w4a8-s8", "w4a8-88"))
-            else (group_size or 64),
+            64 if (backend in ("w4a8", "w4a8-s8", "w4a8-88") and _g > 64) else _g,
         )
         object.__setattr__(self, "_quarot_gs", quarot_gs or group_size)
         object.__setattr__(self, "_act_dtype", act_dtype)
@@ -958,7 +959,9 @@ class wa4Linear(nn.Module):
                                           self._act_dtype)
 
         # ── TINT4 非对称 zp 修正：w=(q-zp)*scale = q'*scale + (8-zp)*scale ──
-        if self._correction is not None and not getattr(self, "_tint4_mode", False):
+        if (self._correction is not None
+                and not getattr(self, "_tint4_mode", False)
+                and os.environ.get("OMNIXPU_T4A8_NOCORR", "0") == "0"):
             try:
                 if backend == "w4a16":
                     act_2d = x2.reshape(-1, s[-1])
@@ -1558,8 +1561,9 @@ class wa4ModelLoader:
                     pass
             if _t4_gs > 64:
                 log.warning(
-                    "[wa4] tint4 权重 gs=%d：onednn s8u4 仅支持 gs<=64 "
-                    "（gs>64 在 A770 上崩溃），自动回退 w4a16", _t4_gs)
+                    "[wa4] tint4 权重 gs=%d：onednn s8u4 在 gs>64 下输出错误"
+                    "（实测 corr~0.1，非崩溃但数值错），自动回退 w4a16；"
+                    "用小 gs（32/64）重新量化即可走 a8", _t4_gs)
                 backend = "w4a16"
         _mode = "kernel"  # kernel 原生（wa4 或 tint4）
         backend = _resolve_backend(backend, caps)
