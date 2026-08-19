@@ -29,8 +29,10 @@ oneDNN INT4 GEMM 家族加速（A770/DG2 XPU）。
 
 ```
 请求 w4a4 / w4a8
-  └─ 逐级回退：w4a4（层间 INT4 传递未实现，预留）→ w4a8（onednn_s8u4_gemm）
-       → w4a16
+  ├─ w4a4（层间 INT4 传递未实现，预留）
+  └─ w4a8（onednn_s8u4_gemm）
+       ├─ tint4 模型额外要求权重 gs<=64（A770 上 gs>64 的 s8u4 会崩溃）
+       └─ gs>64 → 自动回退 w4a16
 请求/回退到 w4a16
   ├─ wa4 模型：onednn_int4_gemm(_preconverted) 缺失 → 纯 python 反量化
   └─ tint4 模型：onednn_int4_gemm_tint4 缺失
@@ -60,8 +62,10 @@ oneDNN INT4 GEMM 家族加速（A770/DG2 XPU）。
 
 ## 已知边界
 
-- tint4 的 a8 后端依赖 `onednn_s8u4_gemm` + s8 激活闭包；若 kernel 无 a8
-  算子会自动回退 a16（插件侧已就绪，kernel 补齐后自动启用）。
+- tint4 的 a8：s8 激活闭包 + raw 权重（不异或）+ per-block zp 修正项
+  （(8-zp)*scale 小矩阵外积），实测 Boogu-Edit(gs=32) 与 a16 同 seed 出图
+  corr 0.9997；**gs>64 的 tint4 模型**（QW/kr2 等 gs=128）在 A770 的
+  oneDNN s8u4 上不支持（崩溃），自动回退 w4a16。
 - WAN / LTX2 视频模型：int4 精度损失较高，暂缓适配。
 - 无 kernel 的 wa4 回退（纯 python）与 tint4 回退（torchao）速度显著慢于
   kernel 路径，仅作可用性兜底。

@@ -77,7 +77,8 @@ def _resolve_backend(requested, caps):
         if cand == "w4a8":
             if caps["s8u4"]:
                 return cand
-            log.warning("[wa4] a8 kernel 不可用（onednn_s8u4_gemm 缺失），自动回退 w4a16")
+            log.warning("[wa4] a8 kernel 不可用（onednn_s8u4_gemm 缺失），"
+                        "自动回退 w4a16")
             continue
         if cand == "w4a16":
             return cand
@@ -380,7 +381,7 @@ def _wrap_qwenimage_attn_shared_quant(model):
         to_q = getattr(m, "to_q", None)
         if not isinstance(to_q, wa4Linear) or getattr(to_q, "_backend", "w4a16") == "w4a16":
             continue
-        gs = getattr(to_q, "_group_size", 64) or 64
+        gs = getattr(to_q, "_act_gs", 0) or (getattr(to_q, "_group_size", 64) or 64)
         orig_fwd = m.forward
 
         def _mk_fwd(orig, gs):
@@ -635,7 +636,8 @@ def _auto_s8_closure(model):
                 projs.append((attr, p))
         if len(projs) < 3:
             continue
-        gs = next((getattr(p, "_group_size", 64) or 64 for _, p in projs), 64)
+        gs = next((getattr(p, "_act_gs", 0) or (getattr(p, "_group_size", 64) or 64)
+                   for _, p in projs), 64)
         orig_fwd = m.forward
 
         def _mk_attn_fwd(orig, _gs):
@@ -662,7 +664,7 @@ def _auto_s8_closure(model):
             if not all(isinstance(p, wa4Linear) and getattr(p, "_backend", "w4a16") == "w4a8"
                        for p in (g, u, d)):
                 continue
-            gs = getattr(g, "_group_size", 64) or 64
+            gs = getattr(g, "_act_gs", 0) or (getattr(g, "_group_size", 64) or 64)
             orig_fwd = m.forward
 
             def _mk_swiglu_fwd(orig, _g, _u, _d, _gs, _gidx):
@@ -748,6 +750,13 @@ class wa4Linear(nn.Module):
         # 权重量化分组（每层 w4a4_group_size，32/64）与 QuaRot 旋转分组
         # （__w4a4_quarot_group_size__，通常 128）是两个概念，分开存储。
         object.__setattr__(self, "_group_size", group_size)
+        # 激活量化分组：a8 下 src 侧 oneDNN 只稳定支持 32/64；
+        # tint4 权重 gs=128 时激活仍按 64 量化（src/wei 分组解耦）。
+        object.__setattr__(
+            self, "_act_gs",
+            64 if (bool(tint4_mode) and backend in ("w4a8", "w4a8-s8", "w4a8-88"))
+            else (group_size or 64),
+        )
         object.__setattr__(self, "_quarot_gs", quarot_gs or group_size)
         object.__setattr__(self, "_act_dtype", act_dtype)
         object.__setattr__(self, "_backend", backend)
@@ -803,9 +812,11 @@ class wa4Linear(nn.Module):
             return
         from omni_xpu_kernel import svdq
         backend = getattr(self, "_backend", "w4a16")
-        if getattr(self, "_tint4_mode", False):
+        if getattr(self, "_tint4_mode", False) or self._correction is not None:
             # TINT4 原生：int32 qdata 的字节视图就是 packed u4（小端 nibble
             # 顺序与 oneDNN u4 布局一致），零转换零拷贝。
+            # tint4-a8（转换路径）：同样用 raw 视图（不 XOR），oneDNN 标量
+            # zp=8 得 q-8，(8-zp)*scale 修正项由 forward 的 correction 分支补。
             self._w_packed = self.w_int4.view(torch.uint8).contiguous()
             self._w_s = self.w_scales
             # 释放 CPU 侧原始引用：_w_packed 是字节视图（持同一 storage），
@@ -813,13 +824,6 @@ class wa4Linear(nn.Module):
             # 否则 tint4 会 GPU 10GB + CPU 10GB 并存（RAM +10GB 的来源）。
             object.__setattr__(self, "w_int4", None)
             object.__setattr__(self, "w_scales", None)
-            if backend in ("w4a8", "w4a8-s8", "w4a8-88"):
-                # a8 仍走转换语义（onednn_s8u4_gemm 用标量 zp=8 + 修正项）：
-                # 需要 signed 形态 packed = raw ^ 0x88
-                if self._w_packed.device.type != "xpu":
-                    self._w_packed = (self._w_packed ^ 0x88)
-                else:
-                    self._w_packed = (self._w_packed ^ 0x88)
         else:
             w_u8 = self.w_int4.to(torch.uint8)
             self._w_packed, self._w_s = svdq.prepare_onednn_weights(w_u8, self.w_scales)
@@ -900,7 +904,7 @@ class wa4Linear(nn.Module):
         # w4a4 : 禁用（层间 INT4 传递未实现）。
         # out_mode="s8"（仅 w4a8）：返回 W4ActS8，层间激活保持 s8。
         backend = getattr(self, "_backend", "w4a16")
-        gs = getattr(self, "_group_size", 64) or 64
+        gs = getattr(self, "_act_gs", 0) or (getattr(self, "_group_size", 64) or 64)
         if backend == "w4a4":
             # 层间 4-bit 传递尚未实现：当前会物化 s8 中间张量，a4 无内存/带宽收益
             # 且精度最差。暂屏蔽，待层间 u4 传递功能完成后重新开放。
@@ -1142,7 +1146,7 @@ def _build_wa4_lora_index(dm: nn.Module) -> dict:
     return index
 
 
-def _convert_tint4_to_wa4(qdata, scale, zp, gs):
+def _convert_tint4_to_wa4(qdata, scale, zp, gs, signed_xor=True):
     """Convert TINT4/torchao Int4PlainInt32Tensor to the wa4 packed format.
 
     torchao semantics: w = (q - zp) * scale, q in [0,15] unsigned, zp per block.
@@ -1156,10 +1160,9 @@ def _convert_tint4_to_wa4(qdata, scale, zp, gs):
              correction [G, N] f32) where correction[g,n] = (8-zp)*scale.
 
     打包捷径：每个 int32 的 4 字节按小端恰好是 4 个 wa4 packed byte
-    （低/高 nibble 正好对应 wa4 的 even/odd 配对），q-8 的 4-bit 补码
-    等价于 q XOR 8（翻转符号位）。因此：
-        packed = qdata.view(uint8) ^ 0x88
-    免去逐 nibble 解包/重排，仅一次字节级 XOR（GPU 实测 10GB 约 0.1s）。
+    （低/高 nibble 正好对应 wa4 的 even/odd 配对）。a16 需要 signed 形态
+    （q XOR 8，oneDNN 标量 zp=8 还原）；a8 走 raw 形态（不 XOR）：
+    oneDNN zp=8 直接得 q-8，再加 (8-zp)*scale 修正项还原 tint4 语义。
 
     返回的 tensor 仍在设备上（GPU），由 _index_int4_from_sd 批量同步后统一
     搬回 CPU——避免 839 层 × 3 次 .cpu() 的逐层设备同步（实测 43.6s）。
@@ -1169,11 +1172,14 @@ def _convert_tint4_to_wa4(qdata, scale, zp, gs):
     out_f = qdata.shape[0]
     in_f = qdata.shape[1] * 8
     blocks = in_f // gs
-    if dev == "xpu":
-        packed = qdata.view(torch.uint8).to(dev, non_blocking=True)
-        packed.bitwise_xor_(0x88)  # 原地翻转符号位，免额外 10GB 分配
+    if signed_xor:
+        if dev == "xpu":
+            packed = qdata.view(torch.uint8).to(dev, non_blocking=True)
+            packed.bitwise_xor_(0x88)  # 原地翻转符号位，免额外 10GB 分配
+        else:
+            packed = (qdata.view(torch.uint8) ^ 0x88)
     else:
-        packed = (qdata.view(torch.uint8) ^ 0x88)
+        packed = qdata.view(torch.uint8).to("cpu") if dev == "xpu" else qdata.view(torch.uint8)
     # scale/corr 小数据，留在 CPU 算（float 多线程，免 GPU 往返）
     scale_wa4 = scale.to(torch.float16).reshape(blocks, out_f).contiguous()
     correction = ((8.0 - zp.float()) * scale.float()).reshape(blocks, out_f).contiguous()
@@ -1227,9 +1233,8 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
                         _TINT4_NATIVE and backend == "w4a16"
                         and mode in ("kernel", "torchao")
                     ):
-                        # 原生模式：raw int32 qdata（_prepare 里 view 成 u4）+
-                        # per-block zp + fp16 scale，零转换、零 GPU 往返。
-                        # kernel 原生直通 onednn_int4_gemm_tint4；
+                        # 原生模式（a16）：raw int32 qdata（_prepare 里 view 成
+                        # u4）+ per-block zp + fp16 scale，零转换、零 GPU 往返。
                         # torchao 回退也用同样的 raw 数据。
                         scale_wa4 = sc_t.to(torch.float16).contiguous()
                         zp_u8 = zp_t.to(torch.uint8).contiguous()
@@ -1243,7 +1248,7 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
                         continue
                     _tc0 = time.time()
                     packed, scale_wa4, corr = _convert_tint4_to_wa4(
-                        w, sc_t, zp_t, gs_t
+                        w, sc_t, zp_t, gs_t, signed_xor=(backend != "w4a8")
                     )
                     _n_conv += 1
                     _t_conv += time.time() - _tc0
@@ -1543,6 +1548,19 @@ class wa4ModelLoader:
             sd.get("__tint4_format__") is not None
             or sd.get("__tint4_group_size__") is not None
         )
+        if is_tint4 and backend == "w4a8":
+            _t4_gs = 64
+            _mk = sd.get("__tint4_group_size__")
+            if _mk is not None:
+                try:
+                    _t4_gs = int(_mk.item())
+                except Exception:
+                    pass
+            if _t4_gs > 64:
+                log.warning(
+                    "[wa4] tint4 权重 gs=%d：onednn s8u4 仅支持 gs<=64 "
+                    "（gs>64 在 A770 上崩溃），自动回退 w4a16", _t4_gs)
+                backend = "w4a16"
         _mode = "kernel"  # kernel 原生（wa4 或 tint4）
         backend = _resolve_backend(backend, caps)
         if backend == "w4a16":
