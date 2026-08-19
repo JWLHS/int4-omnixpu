@@ -1,5 +1,5 @@
 """
-wa4 Model Quantizer v1.0
+INT4 Model Quantizer v1.0
 — FP16/BF16/FP32/FP8/INT8 → INT4 per-group absmax quantization.
 Auto-strips embedded VAE/CLIP, cleans residual FP8.
 
@@ -194,7 +194,7 @@ def _should_quantize(key, tensor, mt):
 
 def _get_hadamard(gs, device="cpu"):
 	try:
-		from .wint8_quarot import build_hadamard
+		from .int4_quarot import build_hadamard
 		return build_hadamard(gs, device=device, dtype=torch.float32)
 	except ImportError:
 		return None
@@ -202,7 +202,7 @@ def _get_hadamard(gs, device="cpu"):
 
 def _rotate_weight_tensor(w, H, gs):
 	try:
-		from .wint8_quarot import rotate_weight
+		from .int4_quarot import rotate_weight
 		return rotate_weight(w, H, gs)
 	except ImportError:
 		return w
@@ -229,7 +229,7 @@ def _quantize_weight(w):
 	raise ValueError(f"in_features {i}: no usable group_size")
 
 
-class wa4ModelQuantizer:
+class int4ModelQuantizer:
 	@classmethod
 	def INPUT_TYPES(s):
 		return {
@@ -247,7 +247,7 @@ class wa4ModelQuantizer:
 	RETURN_TYPES = ()
 	FUNCTION = "quantize"
 	CATEGORY = "wa4"
-	TITLE = "wa4 Model Quantizer v1.0"
+	TITLE = "INT4 Model Quantizer v1.0"
 	OUTPUT_NODE = True
 
 	def quantize(self, unet_name, model_type, output_filename, device,
@@ -263,7 +263,7 @@ class wa4ModelQuantizer:
 				del sd[key]
 				stripped += 1
 		if stripped:
-			log.info("[wa4] Stripped %d VAE/text_encoder keys from merged model", stripped)
+			log.info("[int4] Stripped %d VAE/text_encoder keys from merged model", stripped)
 
 		dev = torch.device(device)
 
@@ -312,7 +312,7 @@ class wa4ModelQuantizer:
 						output_sd[f"{base}.w4a4_group_size"] = torch.tensor([gs], dtype=torch.int32)
 						quant_count += 1
 					except ValueError as e:
-						log.warning("[wa4] Skipped %s: %s", key, e)
+						log.warning("[int4] Skipped %s: %s", key, e)
 						output_sd[key] = tensor
 					continue
 			if key not in output_sd:
@@ -327,7 +327,7 @@ class wa4ModelQuantizer:
 					output_sd[key] = tensor.to(target_dt)
 					converted += 1
 		if converted:
-			log.info("[wa4] Weights → %s (%d converted)", weight_dtype, converted)
+			log.info("[int4] Weights → %s (%d converted)", weight_dtype, converted)
 
 		# ── 写入权重 dtype 标记（loader 读它自动跟随）──
 		output_sd["__w4a4_weight_dtype__"] = torch.tensor(1 if target_dt == torch.bfloat16 else 0, dtype=torch.uint8)
@@ -338,10 +338,10 @@ class wa4ModelQuantizer:
 
 		dst = os.path.join(folder_paths.get_output_directory(), f"{output_filename}.safetensors")
 		save_file(output_sd, dst)
-		log.info("[wa4] Saved: %s | %d quantized | QuaRot=%s | dtype=%s",
+		log.info("[int4] Saved: %s | %d quantized | QuaRot=%s | dtype=%s",
 				 dst, quant_count, "ON" if qa else "OFF", weight_dtype)
 		return ()
 
 
-NODE_CLASS_MAPPINGS = {"wa4ModelQuantizer": wa4ModelQuantizer}
-NODE_DISPLAY_NAME_MAPPINGS = {"wa4ModelQuantizer": "wa4 Model Quantizer v1.0"}
+NODE_CLASS_MAPPINGS = {"int4ModelQuantizer": int4ModelQuantizer}
+NODE_DISPLAY_NAME_MAPPINGS = {"int4ModelQuantizer": "INT4 Model Quantizer v1.0"}

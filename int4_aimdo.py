@@ -1,5 +1,5 @@
 """
-wa4_aimdo.py — WA4 × AIMDO XPU 管控 v1.3
+int4_aimdo.py — WA4 × AIMDO XPU 管控 v1.3
 
 v1.3:
   - lora_policy() 恒返回 'normal'：LoRA 与模型一体，始终注入
@@ -51,9 +51,9 @@ def patch_aimdo_xpu(model) -> bool:
     if st == "none":
         return False
     if st == "broken":
-        log.warning("[wa4] AIMDO: dll 加载但设备未初始化 — wa4 按 none 处理，约束生效")
+        log.warning("[int4] AIMDO: dll 加载但设备未初始化 — wa4 按 none 处理，约束生效")
         return False
     if _orig_cuda_sync is not None:
         torch.cuda.synchronize = _noop_sync
-    log.info("[wa4] AIMDO: active (XPU allocator replaced) — 模型与 LoRA 均由其管控")
+    log.info("[int4] AIMDO: active (XPU allocator replaced) — 模型与 LoRA 均由其管控")
     return True

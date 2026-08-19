@@ -1,5 +1,5 @@
 """
-wa4_lora_loader.py — WA4 LoRA Loader v3.5
+int4_lora_loader.py — INT4 LoRA Loader v3.5
 
 v3.5: FIX — bake 纳入 AIMDO 管理：
   克隆新权重张量（AIMDO allocator 分配）→ 段加 delta → 整体换权重
@@ -15,8 +15,8 @@ v3.0: pre-hook bake (deferred GPU compute, no CPU stall).
 import time, logging
 import torch, torch.nn as nn, re
 import folder_paths, comfy.utils
-from .int4_loader import wa4Linear
-from .wa4_lora_common import (
+from .int4_loader import int4Linear
+from .int4_lora_common import (
     _wa4_reset_all_loras, _auto_detect_format, _convert_bfl_to_standard,
     _parse_raw_lora_sd, _get_accelerator_device, _rot_quarot_tensor,
     _resolve_with_alias,
@@ -29,7 +29,7 @@ def _resolve_qkv_slices(index, norm):
     # █ 原样保留 █
     base = norm.rsplit(".attn", 1)[0]
     for mod in _resolve_with_alias(index, norm):
-        out_f = (mod.out_features if isinstance(mod, wa4Linear)
+        out_f = (mod.out_features if isinstance(mod, int4Linear)
                  else (mod.weight.shape[0] if hasattr(mod, 'weight') and mod.weight is not None else 0))
         if out_f > 0 and out_f % 3 == 0:
             hs = out_f // 3
@@ -39,7 +39,7 @@ def _resolve_qkv_slices(index, norm):
         matches = _resolve_with_alias(index, probe)
         if matches:
             mod = matches[0]
-            out_f = (mod.out_features if isinstance(mod, wa4Linear)
+            out_f = (mod.out_features if isinstance(mod, int4Linear)
                      else (mod.weight.shape[0] if hasattr(mod, 'weight') and mod.weight is not None else 0))
             if out_f > 0:
                 return [(f"{base}.attn.wq", (0, out_f)), (f"{base}.attn.wk", (out_f, 2 * out_f)), (f"{base}.attn.wv", (2 * out_f, 3 * out_f))]
@@ -114,15 +114,15 @@ def _make_bake_pre_hook(module: nn.Module):
     return _pre_hook
 
 
-class WA4LoRALoader:
-    NAME = "WA4 LoRA Loader"
+class INT4LoRALoader:
+    NAME = "INT4 LoRA Loader"
     CATEGORY = "wa4"
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("MODEL", {"tooltip": "From wa4ModelLoader"}),
+                "model": ("MODEL", {"tooltip": "From int4ModelLoader"}),
                 "lora_name": (folder_paths.get_filename_list("loras"),),
                 "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
             },
@@ -140,7 +140,7 @@ class WA4LoRALoader:
 
     def load_lora(self, model, lora_name, strength):
         # ★ AIMDO 兼容：lora_policy 恒 normal（v1.3），不阻断注入
-        from .wa4_aimdo import lora_policy
+        from .int4_aimdo import lora_policy
         if lora_policy() == "skip":
             _wa4_reset_all_loras(model)
             object.__setattr__(model.model, '_wa4_lora_needs_reset', False)
@@ -166,7 +166,7 @@ class WA4LoRALoader:
 
         H = None
         if quarot_enabled and group_size > 0:
-            from .wint8_quarot import build_hadamard
+            from .int4_quarot import build_hadamard
             H = build_hadamard(group_size, device="cpu", dtype=torch.float32)
 
         t0 = time.perf_counter()
@@ -200,7 +200,7 @@ class WA4LoRALoader:
                     key = mid if qkv_slice is None else (mid, target_path)
                     if key in seen: continue
                     seen.add(key)
-                    is_quant = isinstance(module, wa4Linear)
+                    is_quant = isinstance(module, int4Linear)
                     is_linear = isinstance(module, nn.Linear)
                     if not is_quant and not is_linear: continue
 
@@ -237,7 +237,7 @@ class WA4LoRALoader:
     @staticmethod
     def _pop_module_lora(module, lora_name):
         # █ 原样保留（baked delta 回滚，不动）█
-        if isinstance(module, wa4Linear):
+        if isinstance(module, int4Linear):
             le = getattr(module, '_wa4_lora_entries', None)
             if le is not None:
                 le.pop(lora_name, None)
@@ -299,8 +299,8 @@ class WA4LoRALoader:
         # █ 原样保留 █
         w1_c = w1.to(cpu, torch.float16).clone(); w2_c = w2.to(cpu, torch.float16).clone()
         delta = torch.kron(w1_c, w2_c)
-        to2 = module.out_features if isinstance(module, wa4Linear) else module.weight.shape[0]
-        ti2 = module.in_features if isinstance(module, wa4Linear) else module.weight.shape[1]
+        to2 = module.out_features if isinstance(module, int4Linear) else module.weight.shape[0]
+        ti2 = module.in_features if isinstance(module, int4Linear) else module.weight.shape[1]
         if delta.shape[0] < to2: delta = delta.repeat((to2 + delta.shape[0] - 1) // delta.shape[0], 1)
         if delta.shape[0] > to2: delta = delta[:to2, :]
         if delta.shape[1] < ti2: delta = delta.repeat(1, (ti2 + delta.shape[1] - 1) // delta.shape[1])
@@ -329,6 +329,6 @@ class WA4LoRALoader:
                 le.setdefault(lora_name, []).append(("delta", delta, strength))
 
 
-NODE_CLASS_MAPPINGS = {"WA4LoRALoader": WA4LoRALoader}
-NODE_DISPLAY_NAME_MAPPINGS = {"WA4LoRALoader": "WA4 LoRA Loader"}
+NODE_CLASS_MAPPINGS = {"INT4LoRALoader": INT4LoRALoader}
+NODE_DISPLAY_NAME_MAPPINGS = {"INT4LoRALoader": "INT4 LoRA Loader"}
 

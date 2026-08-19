@@ -56,7 +56,7 @@ kernel 分 A/B 两个系列，按你的平台选对应的仓库编译 wheel 后�
 >   更快。
 > - **差异**：非对称 per-block zero point 能把偏置的权重分布逐块归中，
 >   相比对称 INT4 量化误差更小（编辑/姿态迁移类能力保留更好）。
-> - **使用差异**：tint4 文件用本插件的 `wa4ModelLoader`（backend=w4a16）
+> - **使用差异**：tint4 文件用本插件的 `int4ModelLoader`（backend=w4a16）
 >   直接加载即可，不需要装 ComfyUI-TINT4 加载器；两套可以共存，不会冲突。
 
 下载后把模型放到 `ComfyUI/models/diffusion_models/` 下（可自建子目录），
@@ -67,15 +67,15 @@ kernel 分 A/B 两个系列，按你的平台选对应的仓库编译 wheel 后�
 1. 按上面选一个系列的 kernel 编译安装。
 2. 把本插件放进 `ComfyUI/custom_nodes/`。
 3. 模型放入 `models/diffusion_models/`。
-4. 工作流中用 **wa4ModelLoader** 节点：`unet_name` 选模型文件，
+4. 工作流中用 **int4ModelLoader** 节点：`unet_name` 选模型文件，
    `backend` 选 **w4a16**。
 
 节点一览：
 
-- **wa4ModelLoader**：wa4 / tint4 统一加载（当前正式版 backend 仅 w4a16；
+- **int4ModelLoader**：wa4 / tint4 统一加载（当前正式版 backend 仅 w4a16；
   a8/a4 隐藏待开发）。
-- **wa4ModelQuantizer**：把 fp16/bf16/fp8/int8 模型量化为 wa4 格式。
-- **wa4 LoRA Loader / Stack**：LoRA 注入（GPU 侧缓存，避免逐层 H2D 造成
+- **int4ModelQuantizer**：把 fp16/bf16/fp8/int8 模型量化为 wa4 格式。
+- **INT4 LoRA Loader / Stack**：LoRA 注入（GPU 侧缓存，避免逐层 H2D 造成
   CPU 高占用）。
 
 ## 后端回退（安全兜底）

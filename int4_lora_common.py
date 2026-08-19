@@ -1,5 +1,5 @@
 """
-wa4_lora_common.py — Shared LoRA utilities for WA4.
+int4_lora_common.py — Shared LoRA utilities for WA4.
 v2.3: FIX — 删除死规则 ".attn.to_out"→".linear2" 与 ".attn.to_qkv_mlp_proj"→".linear1"：
   索引侧（_normalize_index_path）无 linear1/linear2，LoRA 侧这两条永远产生 unmatched；
   且 linear2 先于 ".to_out.0"→".wo" 执行，把 QW 的 attn.to_out.0 打成 linear2.0（60块全 unmatched）
@@ -8,7 +8,7 @@ v2.1: _wa4_reset_all_loras handles bake-state rollback.
 """
 import logging, re
 import torch
-from .int4_loader import wa4Linear
+from .int4_loader import int4Linear
 
 log = logging.getLogger("WA4-LoRA-Common")
 
@@ -184,12 +184,12 @@ def _parse_raw_lora_sd(lora_sd: dict) -> dict[str, dict]:
 
 
 def _wa4_reset_all_loras(model) -> None:
-    """Full reset: wa4Linear entries + bake-state rollback."""
+    """Full reset: int4Linear entries + bake-state rollback."""
     bm = model.model
     while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
     cpu = torch.device("cpu")
     for m in bm.modules():
-        if isinstance(m, wa4Linear):
+        if isinstance(m, int4Linear):
             object.__setattr__(m, '_wa4_lora_entries', None)
         bs = getattr(m, '_wa4_bake_state', None)
         if bs is None: continue

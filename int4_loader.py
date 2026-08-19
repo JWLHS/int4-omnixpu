@@ -1,5 +1,5 @@
 """
-wa4 Model Loader v1.4.2n — omni_xpu_kernel.svdq oneDNN INT4 GEMM via XMX engine.
+INT4 Model Loader v1.4.2n — omni_xpu_kernel.svdq oneDNN INT4 GEMM via XMX engine.
 Pre-injection + FP8转换 + dtype 按文件标记 + omni norm V3 + QuaRot + LoRA + 显存释放。
 
 v1.4.2n（实验A）：探针无条件安装（AIMDO active 也装，原版 reset+sync 机制）；
@@ -50,7 +50,13 @@ def _kernel_caps():
             hasattr(svdq, "onednn_int4_gemm_preconverted")
             or hasattr(svdq, "onednn_int4_gemm")
         )
-        caps["tint4"] = hasattr(svdq, "onednn_int4_gemm_tint4")
+        # tint4 原生：A 系列 fork 有独立 onednn_int4_gemm_tint4；
+        # B 系列（原仓库 PR）是 onednn_int4_gemm_preconverted 带 zp 参数。
+        caps["tint4"] = (
+            hasattr(svdq, "onednn_int4_gemm_tint4")
+            or hasattr(svdq, "onednn_int4_gemm_preconverted")
+        )
+        caps["tint4_native_op"] = hasattr(svdq, "onednn_int4_gemm_tint4")
     except Exception:
         pass
     return caps
@@ -72,12 +78,12 @@ def _resolve_backend(requested, caps):
         if cand == "w4a4":
             if caps.get("w4a4"):
                 return cand
-            log.warning("[wa4] w4a4 backend 未就绪（层间 INT4 激活传递未实现），逐级回退 w4a8")
+            log.warning("[int4] w4a4 backend 未就绪（层间 INT4 激活传递未实现），逐级回退 w4a8")
             continue
         if cand == "w4a8":
             if caps["s8u4"]:
                 return cand
-            log.warning("[wa4] a8 kernel 不可用（onednn_s8u4_gemm 缺失），"
+            log.warning("[int4] a8 kernel 不可用（onednn_s8u4_gemm 缺失），"
                         "自动回退 w4a16")
             continue
         if cand == "w4a16":
@@ -125,7 +131,7 @@ class Int4LinearPython(nn.Module):
         x2 = x.reshape(-1, x.shape[-1]).to(self._act_dtype)
         if self._use_quarot and self._hadamard_H is not None:
             try:
-                from .wint8_quarot import rotate_activation
+                from .int4_quarot import rotate_activation
                 x2 = rotate_activation(x2, self._hadamard_H, self._quarot_gs)
             except Exception:
                 pass
@@ -162,7 +168,7 @@ class Int4LinearTorchao(nn.Module):
         x2 = x.reshape(-1, x.shape[-1])
         if self._use_quarot and self._hadamard_H is not None:
             try:
-                from .wint8_quarot import rotate_activation
+                from .int4_quarot import rotate_activation
                 x2 = rotate_activation(x2, self._hadamard_H, self._quarot_gs)
             except Exception:
                 pass
@@ -205,7 +211,7 @@ def _sync_point():
     """
     if not _WA4_SYNC:
         return
-    if wa4Linear._call_count % _WA4_SYNC_EVERY == 0:
+    if int4Linear._call_count % _WA4_SYNC_EVERY == 0:
         torch.xpu.synchronize()
         if _AIMDO_EMPTY:
             try:
@@ -213,13 +219,13 @@ def _sync_point():
                 _ok = _aimdo_ctl.empty_xpu_allocator_cache(wait=True)
                 if _AIMDO_EMPTY_TRACE:
                     log.info(
-                        "[wa4] aimdo empty -> %s total=%.0fMB",
+                        "[int4] aimdo empty -> %s total=%.0fMB",
                         _ok,
                         _aimdo_ctl.get_total_vram_usage() / (1024**2),
                     )
             except Exception as _e:
                 if _AIMDO_EMPTY_TRACE:
-                    log.warning("[wa4] aimdo empty failed: %r", _e)
+                    log.warning("[int4] aimdo empty failed: %r", _e)
 
 
 def _ram_gb():
@@ -232,7 +238,7 @@ def _ram_gb():
 
 def _ram_trace(tag):
     if _RAM_TRACE:
-        log.info("[wa4][ram] %-28s %.2f GB", tag, _ram_gb())
+        log.info("[int4][ram] %-28s %.2f GB", tag, _ram_gb())
 
 
 def _empty_cache_enabled():
@@ -251,7 +257,7 @@ class W4ActS8:
 
     Carries the quantized activation (a8 [M,K] int8) and its per-group scale
     ([M, K/gs] f16) together with the original tensor shape/dtype, so a
-    wa4Linear can consume it directly (skipping activation quantization) or
+    int4Linear can consume it directly (skipping activation quantization) or
     dequantize at residual/nonlinear/attention boundaries.
     """
 
@@ -275,14 +281,14 @@ class W4ActS8:
         out = (a8 * self.scale.unsqueeze(-1)).reshape(self.a8.shape)
         out = out.to(self.dtype).reshape(self.orig_shape)
         if (
-            not wa4Linear._nan_trace_logged
+            not int4Linear._nan_trace_logged
             and os.environ.get("OMNIXPU_WA4_NAN_TRACE", "0") != "0"
         ):
             if not torch.isfinite(out).all():
-                wa4Linear._nan_trace_logged = True
+                int4Linear._nan_trace_logged = True
                 sc_f = self.scale.float()
                 log.warning(
-                    "[wa4] NaN in W4ActS8.dequant: shape=%s dtype=%s "
+                    "[int4] NaN in W4ActS8.dequant: shape=%s dtype=%s "
                     "scale_max=%.4g scale_inf=%d scale_nan=%d a8_nonzero=%d",
                     tuple(out.shape), out.dtype,
                     sc_f.abs().max().item(),
@@ -291,8 +297,8 @@ class W4ActS8:
                     int(torch.count_nonzero(self.a8)),
                 )
             elif torch.count_nonzero(out) == 0:
-                wa4Linear._nan_trace_logged = True
-                log.warning("[wa4] ALL-ZERO W4ActS8.dequant: shape=%s dtype=%s", tuple(out.shape), out.dtype)
+                int4Linear._nan_trace_logged = True
+                log.warning("[int4] ALL-ZERO W4ActS8.dequant: shape=%s dtype=%s", tuple(out.shape), out.dtype)
         return out
 
     # ── 张量协议兜底：任何边界运算（残差加法、标量乘、slice、函数调用等）
@@ -354,7 +360,7 @@ class W4ActS8:
 def _aimdo_manages():
     """AIMDO（XPU allocator）是否已接管显存管理。"""
     try:
-        from .wa4_aimdo import aimdo_active
+        from .int4_aimdo import aimdo_active
         return aimdo_active()
     except Exception:
         return False
@@ -379,7 +385,7 @@ def _wrap_qwenimage_attn_shared_quant(model):
         if not isinstance(m, QwenAttn):
             continue
         to_q = getattr(m, "to_q", None)
-        if not isinstance(to_q, wa4Linear) or getattr(to_q, "_backend", "w4a16") == "w4a16":
+        if not isinstance(to_q, int4Linear) or getattr(to_q, "_backend", "w4a16") == "w4a16":
             continue
         gs = getattr(to_q, "_act_gs", 0) or (getattr(to_q, "_group_size", 64) or 64)
         orig_fwd = m.forward
@@ -424,7 +430,7 @@ def _wrap_qwenimage_gelu_s8(model):
         if not isinstance(m, QwenGELU):
             continue
         proj = getattr(m, "proj", None)
-        if not isinstance(proj, wa4Linear) or getattr(proj, "_backend", "w4a16") == "w4a16":
+        if not isinstance(proj, int4Linear) or getattr(proj, "_backend", "w4a16") == "w4a16":
             continue
         object.__setattr__(proj, "_out_mode", "s8")
 
@@ -456,7 +462,7 @@ def _wrap_qwenimage_block_s8(model):
         mlp = getattr(m, "img_mlp", None)
         if mlp is not None and len(getattr(mlp, "net", ())) >= 3:
             proj = mlp.net[2]
-            if isinstance(proj, wa4Linear) and getattr(proj, "_backend", "w4a16") == "w4a8":
+            if isinstance(proj, int4Linear) and getattr(proj, "_backend", "w4a16") == "w4a8":
                 object.__setattr__(proj, "_out_mode", "s8")
                 n_lin += 1
 
@@ -551,19 +557,19 @@ def _wrap_flux_s8(model):
             for attr in ("img_attn", "txt_attn"):
                 attn = getattr(m, attr, None)
                 proj = getattr(attn, "proj", None)
-                if isinstance(proj, wa4Linear) and getattr(proj, "_backend", "w4a16") == "w4a8":
+                if isinstance(proj, int4Linear) and getattr(proj, "_backend", "w4a16") == "w4a8":
                     object.__setattr__(proj, "_out_mode", "s8")
                     n += 1
             for mlp_attr in ("img_mlp", "txt_mlp"):
                 mlp = getattr(m, mlp_attr, None)
                 if mlp is not None and len(mlp) >= 3:
                     p = mlp[2]
-                    if isinstance(p, wa4Linear) and getattr(p, "_backend", "w4a16") == "w4a8":
+                    if isinstance(p, int4Linear) and getattr(p, "_backend", "w4a16") == "w4a8":
                         object.__setattr__(p, "_out_mode", "s8")
                         n += 1
         elif isinstance(m, SingleStreamBlock):
             lin2 = getattr(m, "linear2", None)
-            if isinstance(lin2, wa4Linear) and getattr(lin2, "_backend", "w4a16") == "w4a8":
+            if isinstance(lin2, int4Linear) and getattr(lin2, "_backend", "w4a16") == "w4a8":
                 object.__setattr__(lin2, "_out_mode", "s8")
                 n += 1
     return n
@@ -611,7 +617,7 @@ def _auto_s8_closure(model):
             chain = " <- ".join(
                 f"{f.filename.split(chr(92))[-1]}:{f.lineno}:{f.name}"
                 for f in frames)
-            log.warning("[wa4] _w4: shape=%s K=%d gs=%d mismatch -> fp16 passthrough "
+            log.warning("[int4] _w4: shape=%s K=%d gs=%d mismatch -> fp16 passthrough "
                         "| %s", tuple(x.shape), h.shape[-1], gs, chain)
             return x
         if hasattr(svdq, "quantize_act_s8") and gs in (32, 64):
@@ -624,7 +630,7 @@ def _auto_s8_closure(model):
     counts = {"out_s8": 0, "attn_shared": 0, "swiglu": 0}
     lin_by_id = {}
     for m in model.modules():
-        if isinstance(m, wa4Linear):
+        if isinstance(m, int4Linear):
             lin_by_id[id(m)] = m
 
     # ── 1. 多输入投影 attention：共享量化一次 ─────────────────────────────
@@ -632,7 +638,7 @@ def _auto_s8_closure(model):
         projs = []
         for attr in ("wq", "wk", "wv", "gate", "to_q", "to_k", "to_v"):
             p = getattr(m, attr, None)
-            if isinstance(p, wa4Linear) and getattr(p, "_backend", "w4a16") == "w4a8":
+            if isinstance(p, int4Linear) and getattr(p, "_backend", "w4a16") == "w4a8":
                 projs.append((attr, p))
         if len(projs) < 3:
             continue
@@ -661,7 +667,7 @@ def _auto_s8_closure(model):
             triples.append(("fc1", "fc2", "fc3"))
         for ga, ua, da in triples:
             g, u, d = getattr(m, ga), getattr(m, ua), getattr(m, da)
-            if not all(isinstance(p, wa4Linear) and getattr(p, "_backend", "w4a16") == "w4a8"
+            if not all(isinstance(p, int4Linear) and getattr(p, "_backend", "w4a16") == "w4a8"
                        for p in (g, u, d)):
                 continue
             gs = getattr(g, "_act_gs", 0) or (getattr(g, "_group_size", 64) or 64)
@@ -725,7 +731,7 @@ def _quantize_s8_act(x, group_size):
     return a8.to(torch.int8).view(M, K), scale.float().contiguous()
 
 
-class wa4Linear(nn.Module):
+class int4Linear(nn.Module):
     _call_count = 0
     _nan_trace_logged = False
     # 预热：首次 forward（采样开始，CLIP 已卸载）一次性搬入所有权重，
@@ -772,7 +778,7 @@ class wa4Linear(nn.Module):
         # 数百次 H2D + CPU staging，实测 CPU 打满）
         object.__setattr__(self, "_wa4_lora_gpu", None)
         # "fp16" (default) keeps the classic behaviour; "s8" returns W4ActS8
-        # from w4a8 forward so chained wa4Linear layers can skip re-quantizing.
+        # from w4a8 forward so chained int4Linear layers can skip re-quantizing.
         object.__setattr__(self, "_out_mode", out_mode)
 
     def _preload_to_xpu(self, dev):
@@ -789,23 +795,23 @@ class wa4Linear(nn.Module):
     @staticmethod
     def _prewarm_once(dev):
         """First-call bulk weight preload; no-op afterwards."""
-        if wa4Linear._prewarm_done:
+        if int4Linear._prewarm_done:
             return
-        wa4Linear._prewarm_done = True
-        target = wa4Linear._prewarm_target
+        int4Linear._prewarm_done = True
+        target = int4Linear._prewarm_target
         if target is None:
-            log.info("[wa4] prewarm: no target (skip)")
+            log.info("[int4] prewarm: no target (skip)")
             return
         _t0 = time.perf_counter()
         _n = 0
         for m in target.modules():
-            if isinstance(m, wa4Linear):
+            if isinstance(m, int4Linear):
                 try:
                     m._preload_to_xpu(dev)
                     _n += 1
                 except Exception:
                     pass
-        log.info("[wa4] prewarm: %d layers moved to %s in %.2fs",
+        log.info("[int4] prewarm: %d layers moved to %s in %.2fs",
                  _n, dev, time.perf_counter() - _t0)
 
     def _prepare(self):
@@ -877,7 +883,7 @@ class wa4Linear(nn.Module):
             pass
 
     def forward(self, x):
-        wa4Linear._prewarm_once(getattr(x, "device", None))
+        int4Linear._prewarm_once(getattr(x, "device", None))
         self._prepare()
         from omni_xpu_kernel import svdq
         out_mode = getattr(self, "_out_mode", "fp16")
@@ -910,7 +916,7 @@ class wa4Linear(nn.Module):
             # 层间 4-bit 传递尚未实现：当前会物化 s8 中间张量，a4 无内存/带宽收益
             # 且精度最差。暂屏蔽，待层间 u4 传递功能完成后重新开放。
             raise NotImplementedError(
-                "[wa4] w4a4 backend is disabled: layer-to-layer INT4 activation "
+                "[int4] w4a4 backend is disabled: layer-to-layer INT4 activation "
                 "transfer is not implemented yet. Use w4a8 or w4a16."
             )
         if backend == "w4a16":
@@ -920,7 +926,7 @@ class wa4Linear(nn.Module):
                 x2 = x.reshape(-1, s[-1]).to(self._act_dtype)
             if self._use_quarot and self._hadamard_H is not None:
                 try:
-                    from .wint8_quarot import rotate_activation
+                    from .int4_quarot import rotate_activation
                     x2 = rotate_activation(
                         x2, self._hadamard_H,
                         getattr(self, "_quarot_gs", self._group_size))
@@ -928,8 +934,14 @@ class wa4Linear(nn.Module):
                     pass
             if getattr(self, "_tint4_mode", False):
                 # TINT4 原生：per-block zp 在 oneDNN 内应用，w=(q-zp)*scale
-                o = svdq.onednn_int4_gemm_tint4(
-                    x2, self._w_packed, self._zp, self._w_s)
+                # A 系列 fork 有独立 onednn_int4_gemm_tint4；
+                # B 系列（原仓库 PR）用 onednn_int4_gemm_preconverted 的 zp 参数。
+                if hasattr(svdq, "onednn_int4_gemm_tint4"):
+                    o = svdq.onednn_int4_gemm_tint4(
+                        x2, self._w_packed, self._zp, self._w_s)
+                else:
+                    o = svdq.onednn_int4_gemm_preconverted(
+                        x2, self._w_packed, self._w_s, self._zp)
             else:
                 o = svdq.onednn_int4_gemm_preconverted(x2, self._w_packed, self._w_s)
         else:
@@ -940,7 +952,7 @@ class wa4Linear(nn.Module):
                 x2 = x.reshape(-1, s[-1]).to(self._act_dtype)
                 if self._use_quarot and self._hadamard_H is not None:
                     try:
-                        from .wint8_quarot import rotate_activation
+                        from .int4_quarot import rotate_activation
                         x2 = rotate_activation(
                             x2, self._hadamard_H,
                             getattr(self, "_quarot_gs", self._group_size))
@@ -1032,38 +1044,38 @@ class wa4Linear(nn.Module):
             else:
                 o_s8, o_sc = _quantize_s8_act(o.reshape(-1, o.shape[-1]), gs)
             out_shape = s[:-1] + (o.shape[-1],)
-            wa4Linear._call_count += 1
-            if wa4Linear._call_count % 500 == 0:
-                log.info("[wa4] %d forward calls, xpu mem: %dMB (s8-out)",
-                         wa4Linear._call_count,
+            int4Linear._call_count += 1
+            if int4Linear._call_count % 500 == 0:
+                log.info("[int4] %d forward calls, xpu mem: %dMB (s8-out)",
+                         int4Linear._call_count,
                          torch.xpu.memory_allocated() // 1024 // 1024)
             if _empty_cache_enabled():
                 _empty_cache()
             _sync_point()
             if (
-                not wa4Linear._nan_trace_logged
+                not int4Linear._nan_trace_logged
                 and os.environ.get("OMNIXPU_WA4_NAN_TRACE", "0") != "0"
                 and not torch.isfinite(o).all()
             ):
-                wa4Linear._nan_trace_logged = True
+                int4Linear._nan_trace_logged = True
                 log.warning(
-                    "[wa4] NaN in s8-out GEMM output (call=%d backend=%s "
+                    "[int4] NaN in s8-out GEMM output (call=%d backend=%s "
                     "out=%s in=%s s8_in=%s)",
-                    wa4Linear._call_count, backend, tuple(o.shape),
+                    int4Linear._call_count, backend, tuple(o.shape),
                     tuple(s), s8_in,
                 )
             if (
-                not wa4Linear._nan_trace_logged
+                not int4Linear._nan_trace_logged
                 and os.environ.get("OMNIXPU_WA4_NAN_TRACE", "0") != "0"
                 and torch.isfinite(o).all()
                 and o.numel() > 0
                 and torch.count_nonzero(o) == 0
             ):
-                wa4Linear._nan_trace_logged = True
+                int4Linear._nan_trace_logged = True
                 log.warning(
-                    "[wa4] ALL-ZERO s8-out GEMM output (call=%d backend=%s "
+                    "[int4] ALL-ZERO s8-out GEMM output (call=%d backend=%s "
                     "out=%s in=%s s8_in=%s)",
-                    wa4Linear._call_count, backend, tuple(o.shape),
+                    int4Linear._call_count, backend, tuple(o.shape),
                     tuple(s), s8_in,
                 )
             return W4ActS8(o_s8, o_sc, out_shape, x_dtype, gs)
@@ -1071,24 +1083,24 @@ class wa4Linear(nn.Module):
         if len(s) == 3:
             o = o.reshape(*s[:-1], -1)
         o = o.to(x_dtype)
-        wa4Linear._call_count += 1
-        if wa4Linear._call_count % 500 == 0:
-            log.info("[wa4] %d forward calls, xpu mem: %dMB",
-                     wa4Linear._call_count, torch.xpu.memory_allocated() // 1024 // 1024)
+        int4Linear._call_count += 1
+        if int4Linear._call_count % 500 == 0:
+            log.info("[int4] %d forward calls, xpu mem: %dMB",
+                     int4Linear._call_count, torch.xpu.memory_allocated() // 1024 // 1024)
         if _empty_cache_enabled():
             _empty_cache()
         _sync_point()
         if (
-            not wa4Linear._nan_trace_logged
+            not int4Linear._nan_trace_logged
             and os.environ.get("OMNIXPU_WA4_NAN_TRACE", "0") != "0"
             and isinstance(o, torch.Tensor)
             and not torch.isfinite(o).all()
         ):
-            wa4Linear._nan_trace_logged = True
+            int4Linear._nan_trace_logged = True
             log.warning(
-                "[wa4] NaN detected in fp16-out path (call=%d backend=%s "
+                "[int4] NaN detected in fp16-out path (call=%d backend=%s "
                 "out=%s in=%s s8_in=%s)",
-                wa4Linear._call_count, backend, tuple(o.shape),
+                int4Linear._call_count, backend, tuple(o.shape),
                 tuple(s), s8_in,
             )
         return o
@@ -1123,12 +1135,12 @@ def _normalize_index_path(name: str) -> str | None:
 def _build_wa4_lora_index(dm: nn.Module) -> dict:
     index: dict[str, nn.Module] = {}
     for name, module in dm.named_modules():
-        if not isinstance(module, (wa4Linear, nn.Linear)):
+        if not isinstance(module, (int4Linear, nn.Linear)):
             continue
         norm = _normalize_index_path(name)
         if norm is None:
             continue
-        if norm.endswith(".attn.qkv") and isinstance(module, wa4Linear):
+        if norm.endswith(".attn.qkv") and isinstance(module, int4Linear):
             out_f = module.out_features
             if out_f % 3 == 0:
                 hs = out_f // 3
@@ -1256,7 +1268,7 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
                     _n_conv += 1
                     _t_conv += time.time() - _tc0
                 except Exception as _e:
-                    log.warning("[wa4] TINT4 convert failed %s: %r", base, _e)
+                    log.warning("[int4] TINT4 convert failed %s: %r", base, _e)
                     continue
                 _gpu_conv.append((norm, base, gs_t, packed, scale_wa4, corr))
                 # 转换后立即消费 tint4 辅助键，避免它们进入模型构建触发
@@ -1276,7 +1288,7 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
             or sd.get(f"{base}.comfy_quant") is not None
         ):
             log.warning(
-                "[wa4] Skipping %s: TINT4/torchao format is not compatible "
+                "[int4] Skipping %s: TINT4/torchao format is not compatible "
                 "with the wa4 loader (int32 qdata + per-block zero point)",
                 base,
             )
@@ -1299,14 +1311,14 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
     if _TIMING and _n_conv:
         log.info("[wa4-timing] tint4 conversions: %d layers, wall %.2fs (avg %.3fs)",
                  _n_conv, _t_conv, _t_conv / _n_conv)
-    log.info("[wa4] Indexed %d INT4 groups", len(quant))
+    log.info("[int4] Indexed %d INT4 groups", len(quant))
     return quant
 
 
 def _patch_omni_norm(model, cfg_type):
     """omni norm V3：Krea2 scale+1.0 + wrapper 跳过"""
     if cfg_type in _OMNI_NORM_SKIP:
-        log.info("[wa4] omni norm: skipped (model=%s)", cfg_type)
+        log.info("[int4] omni norm: skipped (model=%s)", cfg_type)
         return
     try:
         from omni_xpu_kernel import norm as onorm
@@ -1345,11 +1357,11 @@ def _patch_omni_norm(model, cfg_type):
                     return y.reshape(x.shape)
                 m.forward = _ln_fwd.__get__(m)
                 patched += 1
-        log.info("[wa4] omni norm patched: %d", patched)
+        log.info("[int4] omni norm patched: %d", patched)
     except ImportError:
         pass
     except Exception:
-        log.warning("[wa4] omni norm patch failed, falling back to PyTorch native")
+        log.warning("[int4] omni norm patch failed, falling back to PyTorch native")
         pass
 
 
@@ -1382,7 +1394,7 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
         if os.environ.get("OMNIXPU_WA4_BIAS_DIAG", "0") != "0" and injected < 3:
             _probe = [k for k in sd.keys() if "attn.to_q.bias" in k or "to_q" in k and k.endswith(".bias")]
             log.info(
-                "[wa4] bias diag: base=%s norm=%s found_base=%s probe_keys=%s",
+                "[int4] bias diag: base=%s norm=%s found_base=%s probe_keys=%s",
                 base, norm, sd_bias is not None, _probe[:3],
             )
         if sd_bias is None:
@@ -1401,7 +1413,7 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
             module.bias = nn.Parameter(torch.empty(0, device='cpu'))
         # 注意：不 pop bias——load_diffusion_model_state_dict 在 get_model
         # 之后会再调一次 load_model_weights，sd 里保留 bias 让第二次加载
-        # 能装进 wa4Linear 的 bias 参数（值相同，无害），避免 839 个
+        # 能装进 int4Linear 的 bias 参数（值相同，无害），避免 839 个
         # "unet missing" 长警告。
         parts = name.split("."); parent = model
         for p in parts[:-1]: parent = parent[int(p)] if p.isdigit() else getattr(parent, p)
@@ -1418,7 +1430,7 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
                 hadamard_H=hadamard_H, quarot_gs=qgs,
             )
         else:
-            new_mod = wa4Linear(in_f, out_f, w_int4, w_scale, bias=bias,
+            new_mod = int4Linear(in_f, out_f, w_int4, w_scale, bias=bias,
                                 use_quarot=use_quarot, hadamard_H=hadamard_H,
                                 group_size=w_gs, act_dtype=act_dtype, backend=backend,
                                 quarot_gs=qgs, correction=w_corr,
@@ -1434,22 +1446,22 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
     # 这里强制对齐，否则未量化层数值路径与 tint4 原厂不一致。
     _n_cast = 0
     for _m in model.modules():
-        if isinstance(_m, nn.Linear) and not isinstance(_m, wa4Linear):
+        if isinstance(_m, nn.Linear) and not isinstance(_m, int4Linear):
             if _m.weight is not None and _m.weight.dtype != act_dtype:
                 _m.weight.data = _m.weight.data.to(act_dtype)
                 _n_cast += 1
             if _m.bias is not None and _m.bias.dtype != act_dtype:
                 _m.bias.data = _m.bias.data.to(act_dtype)
     if _n_cast:
-        log.info("[wa4] cast %d unquantized Linear to %s (AIMDO lazy dtype align)",
+        log.info("[int4] cast %d unquantized Linear to %s (AIMDO lazy dtype align)",
                  _n_cast, act_dtype)
     if os.environ.get("OMNIXPU_WA4_BIAS_DIAG", "0") != "0":
-        _n_wl = sum(1 for _m in model.modules() if isinstance(_m, wa4Linear))
+        _n_wl = sum(1 for _m in model.modules() if isinstance(_m, int4Linear))
         _n_wb = sum(1 for _m in model.modules()
-                    if isinstance(_m, wa4Linear) and _m.bias is not None)
-        log.info("[wa4] bias diag: wa4Linear=%d with_bias=%d", _n_wl, _n_wb)
+                    if isinstance(_m, int4Linear) and _m.bias is not None)
+        log.info("[int4] bias diag: int4Linear=%d with_bias=%d", _n_wl, _n_wb)
     gc.collect()
-    log.info("[wa4] Pre-injected %d wa4Linear (act_dtype=%s), freed %.2f GB",
+    log.info("[int4] Pre-injected %d int4Linear (act_dtype=%s), freed %.2f GB",
              injected, act_dtype, freed / 1024 ** 3)
     for key in list(sd.keys()):
         if key.endswith(".weight_scale") or key.endswith(".w4a4_group_size"): sd.pop(key, None)
@@ -1460,20 +1472,20 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
     object.__setattr__(model, '_wa4_lora_index', index)
     object.__setattr__(model, '_wa4_quarot_enabled', use_quarot)
     object.__setattr__(model, '_wa4_quarot_gs', qgs)
-    log.info("[wa4] LoRA index: %d entries (QuaRot=%s)", len(index), use_quarot)
+    log.info("[int4] LoRA index: %d entries (QuaRot=%s)", len(index), use_quarot)
 
     if quant_info:
-        log.warning("[wa4] ⚠ Unmatched quant_info keys (%d): %s ...",
+        log.warning("[int4] ⚠ Unmatched quant_info keys (%d): %s ...",
                     len(quant_info), list(quant_info.keys())[:15])
     return injected
 
 
-class wa4ModelLoader:
+class int4ModelLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-            # w4a4 暂屏蔽：层间 INT4 激活传递未实现（见 wa4Linear.forward）。
+            # w4a4 暂屏蔽：层间 INT4 激活传递未实现（见 int4Linear.forward）。
             # w4a8-s8(88) 已从 UI 移除：实测比 84 慢且权重内存 x2，无保留价值；
             # 源码路径保留（backend="w4a8-s8" 仍可用）供开发对比。
             "backend": (["w4a16", "w4a8"], {"default": "w4a16"}),
@@ -1481,7 +1493,7 @@ class wa4ModelLoader:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_model"
     CATEGORY = "wa4"
-    TITLE = "wa4 Model Loader v1.4.2n"
+    TITLE = "INT4 Model Loader v1.4.2n"
 
     def load_model(self, unet_name, backend="w4a16"):
         global _LOAD_T0
@@ -1491,7 +1503,7 @@ class wa4ModelLoader:
         sd = comfy.utils.load_torch_file(folder_paths.get_full_path("diffusion_models", unet_name), safe_load=True)
         _t = _tphase("load_torch_file done", _t)
         _ram_trace("load_torch_file done")
-        log.info("[wa4] Loading: %s", unet_name)
+        log.info("[int4] Loading: %s", unet_name)
 
         weight_dtype = torch.bfloat16 if bool(sd.pop("__w4a4_weight_dtype__", torch.tensor(0)).item()) else torch.float16
         # TINT4 模型没有 wa4 的 dtype 标记：从未量化层的实际 dtype 推断
@@ -1508,8 +1520,8 @@ class wa4ModelLoader:
                 if isinstance(_v, torch.Tensor) and _v.dtype == torch.bfloat16:
                     weight_dtype = torch.bfloat16
                     break
-            log.info("[wa4] tint4 dtype inferred: %s", weight_dtype)
-        log.info("[wa4] weight_dtype=%s (from file marker)", weight_dtype)
+            log.info("[int4] tint4 dtype inferred: %s", weight_dtype)
+        log.info("[int4] weight_dtype=%s (from file marker)", weight_dtype)
 
         use_quarot = bool(sd.pop("__w4a4_quarot__", torch.tensor(0)).item())
         qgs = int(sd.pop("__w4a4_quarot_group_size__", torch.tensor(128)).item()) if use_quarot else 128
@@ -1525,21 +1537,21 @@ class wa4ModelLoader:
             except Exception:
                 qgs = 128
             use_quarot = True
-            log.info("[wa4] TINT4 QuaRot ON (gs=%d)", qgs)
+            log.info("[int4] TINT4 QuaRot ON (gs=%d)", qgs)
         if use_quarot:
             try:
-                from .wint8_quarot import build_hadamard
+                from .int4_quarot import build_hadamard
                 hadamard_H = build_hadamard(qgs, device="cpu", dtype=torch.float32)
-                log.info("[wa4] QuaRot ON, gs=%d, H built", qgs)
+                log.info("[int4] QuaRot ON, gs=%d, H built", qgs)
             except Exception as e:
-                log.warning("[wa4] QuaRot H build failed: %s", e)
+                log.warning("[int4] QuaRot H build failed: %s", e)
                 use_quarot = False
 
         fp8_keys = [k for k, v in sd.items() if isinstance(v, torch.Tensor) and v.dtype in _FP8_TYPES]
         if fp8_keys:
             for k in fp8_keys:
                 sd[k] = sd[k].to(weight_dtype)
-            log.info("[wa4] Converted %d FP8 tensors → %s", len(fp8_keys), weight_dtype)
+            log.info("[int4] Converted %d FP8 tensors → %s", len(fp8_keys), weight_dtype)
             _ram_trace("fp8 converted")
 
         # ── 融合回退阶梯：w4a4 → w4a8 → w4a16 → python / torchao ──
@@ -1561,7 +1573,7 @@ class wa4ModelLoader:
                     pass
             if _t4_gs > 64:
                 log.warning(
-                    "[wa4] tint4 权重 gs=%d：onednn s8u4 在 gs>64 下输出错误"
+                    "[int4] tint4 权重 gs=%d：onednn s8u4 在 gs>64 下输出错误"
                     "（实测 corr~0.1，非崩溃但数值错），自动回退 w4a16；"
                     "用小 gs（32/64）重新量化即可走 a8", _t4_gs)
                 backend = "w4a16"
@@ -1575,12 +1587,12 @@ class wa4ModelLoader:
                     _mode = "converted"  # 仅旧 onednn_int4_gemm：走转换路径
                 else:
                     _mode = "torchao"
-                    log.warning("[wa4] tint4 kernel 不可用，回退 torchao（需 torchao-xpu）")
+                    log.warning("[int4] tint4 kernel 不可用，回退 torchao（需 torchao-xpu）")
             else:
                 _mode = "kernel" if caps["int4"] else "python"
                 if _mode == "python":
-                    log.warning("[wa4] int4 kernel 不可用，回退纯 python 反量化")
-        log.info("[wa4] backend=%s mode=%s caps=%s", backend, _mode, caps)
+                    log.warning("[int4] int4 kernel 不可用，回退纯 python 反量化")
+        log.info("[int4] backend=%s mode=%s caps=%s", backend, _mode, caps)
 
         qi = _index_int4_from_sd(sd, backend=backend, mode=_mode)
         _t = _tphase("int4 indexed", _t)
@@ -1622,7 +1634,7 @@ class wa4ModelLoader:
                 if _TIMING:
                     log.info("[wa4-timing] xpu.empty_cache after tint4 conv")
         except Exception as _e:
-            log.warning("[wa4] tint4 conv cache release failed: %r", _e)
+            log.warning("[int4] tint4 conv cache release failed: %r", _e)
 
         import comfy.model_detection as md
         clean_sd = {k: v for k, v in sd.items()
@@ -1639,14 +1651,14 @@ class wa4ModelLoader:
         if cfg is not None and _t4_edit_marker:
             try:
                 cfg.unet_config["default_ref_method"] = "index_timestep_zero"
-                log.info("[wa4] default_ref_method=index_timestep_zero (tint4 edit marker)")
+                log.info("[int4] default_ref_method=index_timestep_zero (tint4 edit marker)")
             except Exception:
                 pass
-        log.info("[wa4] Config: %s%s", cfg_type, " [QuaRot]" if use_quarot else "")
-        if cfg is None: raise RuntimeError("[wa4] Architecture detection failed")
+        log.info("[int4] Config: %s%s", cfg_type, " [QuaRot]" if use_quarot else "")
+        if cfg is None: raise RuntimeError("[int4] Architecture detection failed")
 
         act_dtype = weight_dtype
-        log.info("[wa4] act_dtype=%s (跟随量化器标记)", act_dtype)
+        log.info("[int4] act_dtype=%s (跟随量化器标记)", act_dtype)
 
         _o1 = md.model_config_from_unet
         md.model_config_from_unet = lambda *a, **kw: cfg
@@ -1681,7 +1693,7 @@ class wa4ModelLoader:
 
         # ── AIMDO 适配（让路）──
         try:
-            from .wa4_aimdo import patch_aimdo_xpu
+            from .int4_aimdo import patch_aimdo_xpu
             patch_aimdo_xpu(model)
         except Exception:
             pass
@@ -1696,31 +1708,31 @@ class wa4ModelLoader:
                 dm = dm._orig_mod
             # 预热目标：采样首次 forward 时一次性搬入所有权重（CLIP 已卸载，
             # 不叠加）；重置标志以支持同一进程多次加载。
-            wa4Linear._prewarm_target = dm
-            wa4Linear._prewarm_done = False
+            int4Linear._prewarm_target = dm
+            int4Linear._prewarm_done = False
             # ── 轻量探针（QW 显存约束，AIMDO 下也装）──
             # 预热已消除采样中的显存爬升（实测无探针也稳定），探针默认关闭；
             # 需要对比时设 OMNIXPU_WA4_PROBE=1 可临时恢复。
             if cfg_type == "QwenImage" and os.environ.get("OMNIXPU_WA4_PROBE", "0") != "0":
                 n_probe = _wrap_attn_probe(dm)
                 if n_probe:
-                    log.info("[wa4] attention probe: %d modules (reset_peak+sync)",
+                    log.info("[int4] attention probe: %d modules (reset_peak+sync)",
                              n_probe)
             if backend == "w4a8" and cfg_type == "QwenImage":
                 n_attn = _wrap_qwenimage_attn_shared_quant(dm)
                 if n_attn:
-                    log.info("[wa4] QwenImage s8 closure: shared-quant %d attention blocks",
+                    log.info("[int4] QwenImage s8 closure: shared-quant %d attention blocks",
                              n_attn)
                 # GELU s8-out：默认开启（QW 实测稳定路径）。需要 A/B 时设
                 # OMNIXPU_WA4_GELU_S8=0 关闭。
                 if os.environ.get("OMNIXPU_WA4_GELU_S8", "1") != "0":
                     n_gelu = _wrap_qwenimage_gelu_s8(dm)
                     if n_gelu:
-                        log.info("[wa4] QwenImage s8 closure: gelu s8-out on %d MLPs",
+                        log.info("[int4] QwenImage s8 closure: gelu s8-out on %d MLPs",
                                  n_gelu)
                 n_lin, n_gate = _wrap_qwenimage_block_s8(dm)
                 if n_lin or n_gate:
-                    log.info("[wa4] QwenImage s8 closure: s8-out on %d proj, "
+                    log.info("[int4] QwenImage s8 closure: s8-out on %d proj, "
                              "%d gates dequant", n_lin, n_gate)
             elif backend == "w4a8":
                 # 通用闭包：任何架构（FLUX/Krea2/ZIT/Boogu/...）按角色识别
@@ -1728,12 +1740,12 @@ class wa4ModelLoader:
                 # 张量协议自动反量化。
                 if os.environ.get("OMNIXPU_WA4_AUTO_S8", "1") != "0":
                     counts = _auto_s8_closure(dm)
-                    log.info("[wa4] auto s8 closure: out_s8=%d attn_shared=%d swiglu=%d",
+                    log.info("[int4] auto s8 closure: out_s8=%d attn_shared=%d swiglu=%d",
                              counts["out_s8"], counts["attn_shared"], counts["swiglu"])
                 else:
-                    log.info("[wa4] auto s8 closure: DISABLED (OMNIXPU_WA4_AUTO_S8=0)")
+                    log.info("[int4] auto s8 closure: DISABLED (OMNIXPU_WA4_AUTO_S8=0)")
         except Exception as e:
-            log.warning("[wa4] s8 closure setup skipped: %s", e)
+            log.warning("[int4] s8 closure setup skipped: %s", e)
 
         del sd, qi, clean_sd, tsd
         gc.collect()
@@ -1759,7 +1771,7 @@ class wa4ModelLoader:
                         while hasattr(dm, '_orig_mod'):
                             dm = dm._orig_mod
                         for m in dm.modules():
-                            if isinstance(m, wa4Linear):
+                            if isinstance(m, int4Linear):
                                 m.release_xpu()
                     torch.xpu.synchronize()
                     torch.xpu.empty_cache()
@@ -1768,14 +1780,14 @@ class wa4ModelLoader:
             return _o_detach(unpatch_all)
         object.__setattr__(model, 'detach', _wa4_detach)
 
-        log.info("[wa4] Load complete (dtype=%s, backend=%s)", act_dtype, backend)
+        log.info("[int4] Load complete (dtype=%s, backend=%s)", act_dtype, backend)
         _tphase("load complete", _t)
         _ram_trace("load complete")
         return (model,)
 
 
-NODE_CLASS_MAPPINGS = {"wa4ModelLoader": wa4ModelLoader}
-NODE_DISPLAY_NAME_MAPPINGS = {"wa4ModelLoader": "wa4 Model Loader v1.4.2n"}
+NODE_CLASS_MAPPINGS = {"int4ModelLoader": int4ModelLoader}
+NODE_DISPLAY_NAME_MAPPINGS = {"int4ModelLoader": "INT4 Model Loader v1.4.2n"}
 
 
 # ── 调试：捕获 QW 模型首次前向的真实输入（OMNIXPU_WA4_DUMP_FWD=路径）──
@@ -1800,12 +1812,12 @@ if os.environ.get("OMNIXPU_WA4_DUMP_FWD"):
                         _store,
                         _dump_path,
                     )
-                    log.info("[wa4] dumped first QW forward -> %s", _dump_path)
+                    log.info("[int4] dumped first QW forward -> %s", _dump_path)
             except Exception as _e:
-                log.warning("[wa4] fwd dump failed: %r", _e)
+                log.warning("[int4] fwd dump failed: %r", _e)
             return out
 
         _qwm.QwenImageTransformer2DModel._forward = _qw_fwd_dump
-        log.info("[wa4] QW forward dump armed -> %s", _dump_path)
+        log.info("[int4] QW forward dump armed -> %s", _dump_path)
     except Exception as _e:
-        log.warning("[wa4] QW forward dump arm failed: %r", _e)
+        log.warning("[int4] QW forward dump arm failed: %r", _e)
