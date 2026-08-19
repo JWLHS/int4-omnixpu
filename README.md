@@ -1,5 +1,7 @@
 # int4-omnixpu
 
+[English](README_EN.md) | **中文**
+
 面向 Intel Arc XPU 的统一 **INT4 模型加载器**：同时支持 wa4 格式与
 torchao 后端量化的非对称 INT4 格式（tint4），经 `omni_xpu_kernel` 的
 oneDNN INT4 GEMM 原生加速。
