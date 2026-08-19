@@ -1,8 +1,7 @@
 """
 int4_xpu_lora_stack.py — INT4XPU LoRA Stack v1.3
 
-v1.3: ADD — AIMDO 兼容防护：AIMDO 活跃时跳过 LoRA 注入
-  （实证：AIMDO allocator × LoRA bake = 0xC0000005 崩溃；wa4 让路不覆盖 LoRA 路径）
+v1.3: ADD — AIMDO 兼容防护（lora_policy 恒 normal 后无实际阻断，保留调用点）
 v1.2: FIX — QKV 融合层 seen 条件化（与 loader v3.3 一致）：
   slice 有效 → (module, target) 三段注入；slice 无效(None) → module 去重
   （_make_bake_pre_hook / _resolve_qkv_slices 从 loader 导入，已含形状自适应修复）
@@ -11,7 +10,7 @@ v1.1: Multi-LoRA injection (≤8). Same bake rollback + dedup logic as Loader.
 import time, logging
 import torch, torch.nn as nn
 import folder_paths, comfy.utils
-from .int4_xpu_loader import INT4XPULinear
+from .int4_xpu_loader import _is_quant_linear
 from .int4_xpu_lora_common import (
     _wa4_reset_all_loras, _auto_detect_format, _convert_bfl_to_standard,
     _parse_raw_lora_sd, _get_accelerator_device, _rot_quarot_tensor,
@@ -19,12 +18,12 @@ from .int4_xpu_lora_common import (
 )
 from .int4_xpu_lora_loader import _resolve_qkv_slices, _make_bake_pre_hook
 
-log = logging.getLogger("WA4-LoRA-Stack")
+log = logging.getLogger("int4-LoRA-Stack")
 
 
 class INT4XPULoRAStack:
     NAME = "INT4XPU LoRA Stack"
-    CATEGORY = "wa4"
+    CATEGORY = "int4"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -119,7 +118,7 @@ class INT4XPULoRAStack:
                         key = mid if qkv_slice is None else (mid, target_path)
                         if key in seen: continue
                         seen.add(key)
-                        is_quant = isinstance(module, INT4XPULinear)
+                        is_quant = _is_quant_linear(module)
                         is_linear = isinstance(module, nn.Linear)
                         if not is_quant and not is_linear: continue
                         self._pop_module_lora(module, lora_name)
@@ -157,7 +156,7 @@ class INT4XPULoRAStack:
     @staticmethod
     def _pop_module_lora(module, lora_name):
         # █ 原样保留（baked delta 回滚，不动）█
-        if isinstance(module, INT4XPULinear):
+        if _is_quant_linear(module):
             le = getattr(module, '_wa4_lora_entries', None)
             if le is not None:
                 le.pop(lora_name, None)
@@ -204,7 +203,8 @@ class INT4XPULoRAStack:
             if le is None: le = {}; object.__setattr__(module, '_wa4_lora_entries', le)
             if qkv_slice is not None:
                 sl, se = qkv_slice
-                le.setdefault(lora_name, []).append((A, B[sl:se].contiguous().clone(), mult))
+                le.setdefault(lora_name, []).append(
+                    (A, B[sl:se].contiguous().clone(), mult, sl, se))
             else:
                 le.setdefault(lora_name, []).append((A, B, mult))
 
@@ -212,8 +212,8 @@ class INT4XPULoRAStack:
         # █ 原样保留 █
         w1_c = w1.to(cpu, torch.float16).clone(); w2_c = w2.to(cpu, torch.float16).clone()
         delta = torch.kron(w1_c, w2_c)
-        to2 = module.out_features if isinstance(module, INT4XPULinear) else module.weight.shape[0]
-        ti2 = module.in_features if isinstance(module, INT4XPULinear) else module.weight.shape[1]
+        to2 = module.out_features if hasattr(module, "out_features") else module.weight.shape[0]
+        ti2 = module.in_features if hasattr(module, "in_features") else module.weight.shape[1]
         if delta.shape[0] < to2: delta = delta.repeat((to2 + delta.shape[0] - 1) // delta.shape[0], 1)
         if delta.shape[0] > to2: delta = delta[:to2, :]
         if delta.shape[1] < ti2: delta = delta.repeat(1, (ti2 + delta.shape[1] - 1) // delta.shape[1])
@@ -237,7 +237,8 @@ class INT4XPULoRAStack:
             if le is None: le = {}; object.__setattr__(module, '_wa4_lora_entries', le)
             if qkv_slice is not None:
                 sl, se = qkv_slice
-                le.setdefault(lora_name, []).append(("delta", delta[sl:se, :].contiguous().clone(), strength))
+                le.setdefault(lora_name, []).append(
+                    ("delta", delta[sl:se, :].contiguous().clone(), strength, sl, se))
             else:
                 le.setdefault(lora_name, []).append(("delta", delta, strength))
 

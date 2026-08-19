@@ -17,7 +17,7 @@ v1.4.2m:
 import gc, os, time, types, torch, torch.nn as nn, torch.nn.functional as F, comfy.ops, comfy.utils
 import comfy.model_detection, comfy.sd, folder_paths, logging
 
-log = logging.getLogger("wa4")
+log = logging.getLogger("int4")
 
 _FP8_TYPES = set()
 for _name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
@@ -55,10 +55,6 @@ def _kernel_caps():
         caps["tint4"] = (
             hasattr(svdq, "onednn_int4_gemm_tint4")
             or hasattr(svdq, "onednn_int4_gemm_preconverted")
-        )
-        caps["tint4_native_op"] = (
-            hasattr(svdq, "onednn_int4_gemm_tint4")
-            or hasattr(svdq, "onednn_int4_gemm_torchao")
         )
     except Exception:
         pass
@@ -116,6 +112,7 @@ class Int4LinearPython(nn.Module):
         self._hadamard_H = hadamard_H
         self._quarot_gs = quarot_gs or group_size
         object.__setattr__(self, "_wa4_lora_entries", None)
+        object.__setattr__(self, "_wa4_lora_gpu", None)
 
     def _dequant(self, dev):
         packed = self._packed.to(dev)
@@ -144,6 +141,10 @@ class Int4LinearPython(nn.Module):
         w = self._dequant(dev)  # 局部反量化，forward 结束即释放
         out = F.linear(x2, w)
         del w
+        entries = self._wa4_lora_entries
+        if entries is not None and len(entries) > 0:
+            cd = x2.dtype if x2.dtype in (torch.float16, torch.bfloat16) else self._act_dtype
+            out = _apply_wa4_lora(self, x2, out, entries, dev, cd)
         if self.bias is not None:
             out = out + self.bias.to(device=dev, dtype=out.dtype)
         return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -168,6 +169,7 @@ class Int4LinearTorchao(nn.Module):
         self._quarot_gs = quarot_gs or group_size
         object.__setattr__(self, "_qt", None)
         object.__setattr__(self, "_wa4_lora_entries", None)
+        object.__setattr__(self, "_wa4_lora_gpu", None)
 
     def forward(self, x):
         dev = x.device
@@ -194,6 +196,10 @@ class Int4LinearTorchao(nn.Module):
             # 解包 nibbles -> w = (q - zp) * scale -> F.linear。
             w = self._python_dequant(dev)
             out = F.linear(x2, w)
+        entries = self._wa4_lora_entries
+        if entries is not None and len(entries) > 0:
+            cd = x2.dtype if x2.dtype in (torch.float16, torch.bfloat16) else self._act_dtype
+            out = _apply_wa4_lora(self, x2, out, entries, dev, cd)
         if self.bias is not None:
             out = out + self.bias.to(device=dev, dtype=out.dtype)
         return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -212,6 +218,71 @@ class Int4LinearTorchao(nn.Module):
         z = self._zp.to(dev).float().t().unsqueeze(-1).expand(N, G, gs).reshape(N, K)
         s = self._scale.to(dev).float().t().unsqueeze(-1).expand(N, G, gs).reshape(N, K)
         return ((q - z) * s).to(self._act_dtype)
+
+
+def _is_quant_linear(m):
+    """量化层判定（kernel 原生 + python/torchao 回退类），LoRA 索引/注入共用。"""
+    return isinstance(m, (INT4XPULinear, Int4LinearPython, Int4LinearTorchao))
+
+
+def _lora_cache_fetch(module, entries, dev, cd):
+    """LoRA 权重只搬一次 GPU：entries 不变 + 设备/精度不变时复用已搬张量。"""
+    g = getattr(module, "_wa4_lora_gpu", None)
+    if g is None or g[1] != id(entries) or g[2] != (dev, cd):
+        g = ({}, id(entries), (dev, cd))
+        object.__setattr__(module, "_wa4_lora_gpu", g)
+    return g[0]
+
+
+def _apply_wa4_lora(module, x2, out, entries, dev, cd):
+    """在 GEMM 输出上叠加 LoRA（kernel / python / torchao 三类共用）。
+
+    entries: {lora_name: [ (A, B, mult[, sl, se]) | ("delta", delta, mult[, sl, se]) ]}
+    带 sl/se 的分片条目写入 out[:, sl:se]（融合 QKV 三段注入）；
+    不带分片时保持原有全量行为。形状对不上时打警告并跳过，不再静默。
+    """
+    if entries is None or len(entries) == 0:
+        return out
+    o = out
+    _gmap = _lora_cache_fetch(module, entries, dev, cd)
+    for lora_entries in entries.values():
+        for entry in lora_entries:
+            etype = entry[0] if isinstance(entry[0], str) else None
+            sl = entry[3] if len(entry) > 3 else None
+            se = entry[4] if len(entry) > 4 else None
+            if etype == "delta":
+                _, delta_cpu, mult = entry[:3]
+                d = _gmap.get(("delta", id(delta_cpu)))
+                if d is None:
+                    d = delta_cpu.to(dev, dtype=cd)
+                    _gmap[("delta", id(delta_cpu))] = d
+                lo = x2 @ d.T * mult
+                del d
+            else:
+                A_cpu, B_cpu, mult = entry[:3]
+                Ad = _gmap.get(("A", id(A_cpu)))
+                if Ad is None:
+                    Ad = A_cpu.to(dev, dtype=cd)
+                    _gmap[("A", id(A_cpu))] = Ad
+                Bd = _gmap.get(("B", id(B_cpu)))
+                if Bd is None:
+                    Bd = B_cpu.to(dev, dtype=cd)
+                    _gmap[("B", id(B_cpu))] = Bd
+                lo = (x2 @ Ad.T) @ Bd.T * mult
+                del Ad, Bd
+            if sl is not None and se is not None and lo.shape[1] == (se - sl):
+                lo_p = torch.nn.functional.pad(lo, (sl, o.shape[1] - se)).to(o.dtype)
+                o = o + lo_p
+                del lo_p
+            elif lo.shape[1] == o.shape[1]:
+                o = o + lo.to(o.dtype)
+            else:
+                log.warning(
+                    "[int4] LoRA shape mismatch lo=%s o=%s sl=%s se=%s — skip",
+                    tuple(lo.shape), tuple(o.shape), sl, se,
+                )
+            del lo
+    return o
 
 
 def _tphase(name, mark=None):
@@ -1028,40 +1099,7 @@ class INT4XPULinear(nn.Module):
             cd = self._act_dtype
             if x2 is None:
                 x2 = x.dequant().reshape(-1, s[-1])
-            # LoRA GPU 缓存：entries 不变 + 设备/精度不变时复用已搬好的
-            # 张量（只搬一次）；entries 被替换（新 LoRA 栈）或换设备时重建。
-            _gcache = self._wa4_lora_gpu
-            if _gcache is None or _gcache[1] != id(entries) or _gcache[2] != (dev, cd):
-                _gcache = ({}, id(entries), (dev, cd))
-                object.__setattr__(self, "_wa4_lora_gpu", _gcache)
-            _gmap = _gcache[0]
-            for lora_entries in entries.values():
-                for entry in lora_entries:
-                    etype = entry[0] if isinstance(entry[0], str) else None
-                    if etype == "delta":
-                        _, delta_cpu, mult = entry[:3]
-                        d = _gmap.get(id(delta_cpu))
-                        if d is None:
-                            d = delta_cpu.to(dev, dtype=cd)
-                            _gmap[id(delta_cpu)] = d
-                        lo = x2 @ d.T * mult
-                        if lo.shape[1] == o.shape[1]:
-                            o = o + lo.to(o.dtype)
-                        del lo, d
-                    else:
-                        A_cpu, B_cpu, mult = entry[:3]
-                        Ad = _gmap.get(("A", id(A_cpu)))
-                        if Ad is None:
-                            Ad = A_cpu.to(dev, dtype=cd)
-                            _gmap[("A", id(A_cpu))] = Ad
-                        Bd = _gmap.get(("B", id(B_cpu)))
-                        if Bd is None:
-                            Bd = B_cpu.to(dev, dtype=cd)
-                            _gmap[("B", id(B_cpu))] = Bd
-                        lo = (x2 @ Ad.T) @ Bd.T * mult
-                        if lo.shape[1] == o.shape[1]:
-                            o = o + lo.to(o.dtype)
-                        del lo, Ad, Bd
+            o = _apply_wa4_lora(self, x2, o, entries, dev, cd)
             del x2
 
         if self.bias is not None:
@@ -1166,12 +1204,12 @@ def _normalize_index_path(name: str) -> str | None:
 def _build_wa4_lora_index(dm: nn.Module) -> dict:
     index: dict[str, nn.Module] = {}
     for name, module in dm.named_modules():
-        if not isinstance(module, (INT4XPULinear, nn.Linear)):
+        if not _is_quant_linear(module) and not isinstance(module, nn.Linear):
             continue
         norm = _normalize_index_path(name)
         if norm is None:
             continue
-        if norm.endswith(".attn.qkv") and isinstance(module, INT4XPULinear):
+        if norm.endswith(".attn.qkv") and _is_quant_linear(module):
             out_f = module.out_features
             if out_f % 3 == 0:
                 hs = out_f // 3
@@ -1276,8 +1314,9 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
                     if norm is None:
                         continue
                     if (
-                        _TINT4_NATIVE and backend == "w4a16"
+                        backend == "w4a16"
                         and mode in ("kernel", "torchao")
+                        and (_TINT4_NATIVE or mode == "torchao")
                     ):
                         # 原生模式（a16）：raw int32 qdata（_prepare 里 view 成
                         # u4）+ per-block zp + fp16 scale，零转换、零 GPU 往返。
@@ -1526,7 +1565,7 @@ class int4XPUModelLoader:
         }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_model"
-    CATEGORY = "wa4"
+    CATEGORY = "int4"
     TITLE = "INT4XPU Model Loader v1.4.2n"
 
     def load_model(self, unet_name, backend="w4a16"):

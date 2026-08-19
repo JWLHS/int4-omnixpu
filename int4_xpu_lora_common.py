@@ -8,9 +8,9 @@ v2.1: _wa4_reset_all_loras handles bake-state rollback.
 """
 import logging, re
 import torch
-from .int4_xpu_loader import INT4XPULinear
+from .int4_xpu_loader import _is_quant_linear
 
-log = logging.getLogger("WA4-LoRA-Common")
+log = logging.getLogger("int4-LoRA-Common")
 
 
 def _get_accelerator_device() -> torch.device:
@@ -189,7 +189,7 @@ def _wa4_reset_all_loras(model) -> None:
     while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
     cpu = torch.device("cpu")
     for m in bm.modules():
-        if isinstance(m, INT4XPULinear):
+        if _is_quant_linear(m):
             object.__setattr__(m, '_wa4_lora_entries', None)
         bs = getattr(m, '_wa4_bake_state', None)
         if bs is None: continue

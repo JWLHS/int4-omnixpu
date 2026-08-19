@@ -109,7 +109,8 @@ torchao；无 kernel 时自动回退到 torchao 路径，功能完整、速度�
 ```
 
 日志会打印 `backend=... mode=...` 说明实际生效路径。回退路径速度显著慢于
-kernel，但保证可用、不中断。
+kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生效（回退路径
+在反量化/torchao 输出上叠加，功能一致、速度更慢）。
 
 ## 性能参照（8 步，1024×1024，同 seed）
 
@@ -140,6 +141,7 @@ kernel，但保证可用、不中断。
 
 | 变量 | 原仓库默认 | 我们本地测试参数（参考） | 含义 |
 |---|---|---|---|
+| `OMNI_ATTN_BACKEND` | Windows: torch / 其他: auto | esimd | OmniXPU 的注意力后端选择。**Windows 上默认 torch（ESIMD 注意力补丁不挂载）**，A770/DG2 想吃到注意力 ESIMD 加速需显式设 `esimd` |
 | `OMNIXPU_ATTN_NAN_CHECK` | 1（开） | 0 | A 系列 kernel ESIMD attention 的 fp16 NaN 全扫开关。原仓库默认开（安全）；本地测试关掉提速，排查黑图/NaN 时再开回 1 |
 | `OMNIXPU_SDP_CACHE_AUTOCLEAR` | clear | keep | A 系列 sdp sidecar 缓存跨模型卸载是否保留。原仓库默认每轮清（省显存）；本地测试 keep 避免每轮重新编译 |
 | `OMNIXPU_ATTENTION` / `OMNIXPU_NORM` | 1 | 1 | ComfyUI-OmniXPU 的 attention/norm 加速开关；默认开，设 0 关闭 |

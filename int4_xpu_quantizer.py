@@ -15,7 +15,7 @@ import folder_paths
 import comfy.utils
 from safetensors.torch import save_file
 
-log = logging.getLogger("wa4")
+log = logging.getLogger("int4")
 
 INT4_MAX = 8
 
@@ -246,7 +246,7 @@ class int4XPUModelQuantizer:
 
 	RETURN_TYPES = ()
 	FUNCTION = "quantize"
-	CATEGORY = "wa4"
+	CATEGORY = "int4"
 	TITLE = "INT4XPU Model Quantizer v1.0"
 	OUTPUT_NODE = True
 

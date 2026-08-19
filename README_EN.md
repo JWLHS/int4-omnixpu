@@ -128,7 +128,9 @@ request w4a16
 
 The log prints `backend=... mode=...` to show the active path. Fallback
 paths are significantly slower than the kernel but are guaranteed to work
-without interruption.
+without interruption; LoRA works on both the kernel and fallback paths (on
+fallback it is applied on top of the dequantized/torchao output — same
+function, slower).
 
 ## Performance reference (8 steps, 1024×1024, same seed)
 
@@ -163,6 +165,7 @@ then **our local test settings (reference only)** and why:
 
 | Variable | Upstream default | Our local test value (ref) | Meaning |
 |---|---|---|---|
+| `OMNI_ATTN_BACKEND` | Windows: torch / others: auto | esimd | OmniXPU attention backend selection. **On Windows the default is `torch` (the ESIMD attention patch is not mounted)**, so A770/DG2 users must set `esimd` explicitly to get ESIMD attention acceleration |
 | `OMNIXPU_ATTN_NAN_CHECK` | 1 (on) | 0 | fp16 NaN full-scan for A-series ESIMD attention. Upstream keeps it on (safe); locally we turn it off for speed and back on when debugging black/NaN images |
 | `OMNIXPU_SDP_CACHE_AUTOCLEAR` | clear | keep | whether the A-series sdp sidecar cache survives model unload. Upstream clears it every round (saves VRAM); locally we keep it to avoid recompiling |
 | `OMNIXPU_ATTENTION` / `OMNIXPU_NORM` | 1 | 1 | ComfyUI-OmniXPU attention/norm acceleration switches; set 0 to disable |

@@ -15,35 +15,33 @@ v3.0: pre-hook bake (deferred GPU compute, no CPU stall).
 import time, logging
 import torch, torch.nn as nn, re
 import folder_paths, comfy.utils
-from .int4_xpu_loader import INT4XPULinear
+from .int4_xpu_loader import _is_quant_linear
 from .int4_xpu_lora_common import (
     _wa4_reset_all_loras, _auto_detect_format, _convert_bfl_to_standard,
     _parse_raw_lora_sd, _get_accelerator_device, _rot_quarot_tensor,
     _resolve_with_alias,
 )
 
-log = logging.getLogger("WA4-LoRA")
+log = logging.getLogger("int4-LoRA")
 
 
 def _resolve_qkv_slices(index, norm):
-    # █ 原样保留 █
+    """融合 QKV 三段切片：先按整层 out_features 判定，逐 target 兜底。"""
     base = norm.rsplit(".attn", 1)[0]
     for mod in _resolve_with_alias(index, norm):
-        out_f = (mod.out_features if isinstance(mod, INT4XPULinear)
+        out_f = (mod.out_features if hasattr(mod, "out_features")
                  else (mod.weight.shape[0] if hasattr(mod, 'weight') and mod.weight is not None else 0))
         if out_f > 0 and out_f % 3 == 0:
             hs = out_f // 3
             return [(f"{base}.attn.wq", (0, hs)), (f"{base}.attn.wk", (hs, 2 * hs)), (f"{base}.attn.wv", (2 * hs, 3 * hs))]
-        return [(f"{base}.attn.wq", None), (f"{base}.attn.wk", None), (f"{base}.attn.wv", None)]
     for probe in [f"{base}.attn.wq", f"{base}.attn.wk", f"{base}.attn.wv"]:
         matches = _resolve_with_alias(index, probe)
         if matches:
             mod = matches[0]
-            out_f = (mod.out_features if isinstance(mod, INT4XPULinear)
+            out_f = (mod.out_features if hasattr(mod, "out_features")
                      else (mod.weight.shape[0] if hasattr(mod, 'weight') and mod.weight is not None else 0))
             if out_f > 0:
                 return [(f"{base}.attn.wq", (0, out_f)), (f"{base}.attn.wk", (out_f, 2 * out_f)), (f"{base}.attn.wv", (2 * out_f, 3 * out_f))]
-        break
     return [(f"{base}.attn.wq", None), (f"{base}.attn.wk", None), (f"{base}.attn.wv", None)]
 
 
@@ -116,7 +114,7 @@ def _make_bake_pre_hook(module: nn.Module):
 
 class INT4XPULoRALoader:
     NAME = "INT4XPU LoRA Loader"
-    CATEGORY = "wa4"
+    CATEGORY = "int4"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -200,7 +198,7 @@ class INT4XPULoRALoader:
                     key = mid if qkv_slice is None else (mid, target_path)
                     if key in seen: continue
                     seen.add(key)
-                    is_quant = isinstance(module, INT4XPULinear)
+                    is_quant = _is_quant_linear(module)
                     is_linear = isinstance(module, nn.Linear)
                     if not is_quant and not is_linear: continue
 
@@ -237,7 +235,7 @@ class INT4XPULoRALoader:
     @staticmethod
     def _pop_module_lora(module, lora_name):
         # █ 原样保留（baked delta 回滚，不动）█
-        if isinstance(module, INT4XPULinear):
+        if _is_quant_linear(module):
             le = getattr(module, '_wa4_lora_entries', None)
             if le is not None:
                 le.pop(lora_name, None)
@@ -291,7 +289,8 @@ class INT4XPULoRALoader:
             if le is None: le = {}; object.__setattr__(module, '_wa4_lora_entries', le)
             if qkv_slice is not None:
                 sl, se = qkv_slice
-                le.setdefault(lora_name, []).append((A, B[sl:se].contiguous().clone(), mult))
+                le.setdefault(lora_name, []).append(
+                    (A, B[sl:se].contiguous().clone(), mult, sl, se))
             else:
                 le.setdefault(lora_name, []).append((A, B, mult))
 
@@ -299,8 +298,8 @@ class INT4XPULoRALoader:
         # █ 原样保留 █
         w1_c = w1.to(cpu, torch.float16).clone(); w2_c = w2.to(cpu, torch.float16).clone()
         delta = torch.kron(w1_c, w2_c)
-        to2 = module.out_features if isinstance(module, INT4XPULinear) else module.weight.shape[0]
-        ti2 = module.in_features if isinstance(module, INT4XPULinear) else module.weight.shape[1]
+        to2 = module.out_features if hasattr(module, "out_features") else module.weight.shape[0]
+        ti2 = module.in_features if hasattr(module, "in_features") else module.weight.shape[1]
         if delta.shape[0] < to2: delta = delta.repeat((to2 + delta.shape[0] - 1) // delta.shape[0], 1)
         if delta.shape[0] > to2: delta = delta[:to2, :]
         if delta.shape[1] < ti2: delta = delta.repeat(1, (ti2 + delta.shape[1] - 1) // delta.shape[1])
@@ -324,7 +323,8 @@ class INT4XPULoRALoader:
             if le is None: le = {}; object.__setattr__(module, '_wa4_lora_entries', le)
             if qkv_slice is not None:
                 sl, se = qkv_slice
-                le.setdefault(lora_name, []).append(("delta", delta[sl:se, :].contiguous().clone(), strength))
+                le.setdefault(lora_name, []).append(
+                    ("delta", delta[sl:se, :].contiguous().clone(), strength, sl, se))
             else:
                 le.setdefault(lora_name, []).append(("delta", delta, strength))
 
