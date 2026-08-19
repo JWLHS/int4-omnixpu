@@ -5,11 +5,15 @@ oneDNN INT4 GEMM 家族加速（A770/DG2 XPU）。
 
 ## 依赖
 
-- **omni_xpu_kernel**（必需加速后端，**手动安装**）：分 A/B 版且更新频繁，
-  本插件不提供自动安装。安装方式见
-  [ComfyUI-OmniXPU](https://github.com/Blackwood416/ComfyUI-OmniXPU) 的
-  README，或从 `omni-xpu-kernel` 仓库按 A770 目标编译 wheel 后
-  `pip install <wheel>`。
+- **omni_xpu_kernel**（必需加速后端，**手动安装**，本插件不提供自动安装）：
+  kernel 分 A/B 系列，按你的平台选对应仓库：
+
+| 系列 | 目标 | 仓库 |
+|---|---|---|
+| **B 系列** | BMG / PTL-H（非 A770） | 原仓库 [intel/llm-scaler](https://github.com/intel/llm-scaler)（`omni/omni_xpu_kernel`，按上游方式编译安装） |
+| **A 系列** | A770 / DG2 | SDP 适配仓库 [Blackwood416/omni-xpu-kernel](https://github.com/Blackwood416/omni-xpu-kernel)（配合 [ComfyUI-OmniXPU](https://github.com/Blackwood416/ComfyUI-OmniXPU)） |
+
+  按所选仓库 README 编译 wheel 后 `pip install <wheel>`。
 - **torchao**（仅 tint4 模型无 kernel 回退时必需）：插件启动时自动检测，
   缺失/过旧时自动 `pip install torchao --isolated --index-url
   https://download.pytorch.org/whl/xpu`（tint4 插件同款机制）。
