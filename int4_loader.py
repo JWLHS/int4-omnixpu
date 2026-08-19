@@ -56,7 +56,10 @@ def _kernel_caps():
             hasattr(svdq, "onednn_int4_gemm_tint4")
             or hasattr(svdq, "onednn_int4_gemm_preconverted")
         )
-        caps["tint4_native_op"] = hasattr(svdq, "onednn_int4_gemm_tint4")
+        caps["tint4_native_op"] = (
+            hasattr(svdq, "onednn_int4_gemm_tint4")
+            or hasattr(svdq, "onednn_int4_gemm_torchao")
+        )
     except Exception:
         pass
     return caps
@@ -934,10 +937,13 @@ class int4Linear(nn.Module):
                     pass
             if getattr(self, "_tint4_mode", False):
                 # TINT4 原生：per-block zp 在 oneDNN 内应用，w=(q-zp)*scale
-                # A 系列 fork 有独立 onednn_int4_gemm_tint4；
-                # B 系列（原仓库 PR）用 onednn_int4_gemm_preconverted 的 zp 参数。
+                # A 系列 fork：独立 onednn_int4_gemm_tint4 / torchao 名；
+                # B 系列（原仓库 PR）：onednn_int4_gemm_preconverted 的 zp 参数。
                 if hasattr(svdq, "onednn_int4_gemm_tint4"):
                     o = svdq.onednn_int4_gemm_tint4(
+                        x2, self._w_packed, self._zp, self._w_s)
+                elif hasattr(svdq, "onednn_int4_gemm_torchao"):
+                    o = svdq.onednn_int4_gemm_torchao(
                         x2, self._w_packed, self._zp, self._w_s)
                 else:
                     o = svdq.onednn_int4_gemm_preconverted(
