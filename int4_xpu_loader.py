@@ -184,8 +184,9 @@ class Int4LinearTorchao(nn.Module):
                     Int4PlainInt32Tensor,
                 )
                 self._qt = Int4PlainInt32Tensor(
-                    self._qdata.to(dev), self._scale.to(dev), self._zp.to(dev),
-                    self._gs, [self.out_features, self.in_features],
+                    self._qdata.to(dev), self._scale.to(dev),
+                    self._zp.to(device=dev, dtype=torch.int8),
+                    [1, self._gs], [self.out_features, self.in_features],
                 )
             out = F.linear(x2, self._qt, None)
         except Exception as _tao_e:
