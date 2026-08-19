@@ -27,13 +27,13 @@ for _name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnu
 _OMNI_NORM_SKIP = {"Boogu", "QwenImage", "Wan", "CogVideoX", "ZImage", "Lens", "Lightricks"}
 _DETACH_RELEASE_MODELS = {"QwenImage"}
 
-_WA4_SYNC = os.environ.get("OMNIXPU_WA4_SYNC", "1") != "0"
-_WA4_SYNC_EVERY = int(os.environ.get("OMNIXPU_WA4_SYNC_EVERY", "64"))
+_WA4_SYNC = os.environ.get("OMNIXPU_INT4_SYNC", "1") != "0"
+_WA4_SYNC_EVERY = int(os.environ.get("OMNIXPU_INT4_SYNC_EVERY", "64"))
 _RAM_TRACE = os.environ.get("OMNIXPU_RAM_TRACE", "0") != "0"
-_AIMDO_EMPTY = os.environ.get("OMNIXPU_WA4_AIMDO_EMPTY", "0") != "0"
-_AIMDO_EMPTY_TRACE = os.environ.get("OMNIXPU_WA4_EMPTY_TRACE", "0") != "0"
-_TIMING = os.environ.get("OMNIXPU_WA4_TIMING", "0") != "0"
-_TINT4_NATIVE = os.environ.get("OMNIXPU_WA4_TINT4_NATIVE", "1") != "0"
+_AIMDO_EMPTY = os.environ.get("OMNIXPU_INT4_AIMDO_EMPTY", "0") != "0"
+_AIMDO_EMPTY_TRACE = os.environ.get("OMNIXPU_INT4_EMPTY_TRACE", "0") != "0"
+_TIMING = os.environ.get("OMNIXPU_INT4_TIMING", "0") != "0"
+_TINT4_NATIVE = os.environ.get("OMNIXPU_INT4_TINT4_NATIVE", "1") != "0"
 _LOAD_T0 = 0.0
 
 
@@ -190,7 +190,7 @@ class Int4LinearTorchao(nn.Module):
 
 
 def _tphase(name, mark=None):
-    """分阶段计时（仅 OMNIXPU_WA4_TIMING=1 时输出，默认零开销）。"""
+    """分阶段计时（仅 OMNIXPU_INT4_TIMING=1 时输出，默认零开销）。"""
     global _LOAD_T0
     if not _TIMING:
         return time.time()
@@ -209,7 +209,7 @@ def _sync_point():
     oneDNN GEMMs execute asynchronously on the torch queue; without a
     periodic host-side sync their USM allocations and the driver-level
     footprint stay pinned high. AIMDO's physical page pool also keeps pages
-    after the run (physical_release ~= 0), so when OMNIXPU_WA4_AIMDO_EMPTY=1
+    after the run (physical_release ~= 0), so when OMNIXPU_INT4_AIMDO_EMPTY=1
     we additionally ask AIMDO to release cached pages at the same point.
     """
     if not _WA4_SYNC:
@@ -245,7 +245,7 @@ def _ram_trace(tag):
 
 
 def _empty_cache_enabled():
-    return os.environ.get("OMNIXPU_WA4_EMPTY_CACHE", "0") != "0"
+    return os.environ.get("OMNIXPU_INT4_EMPTY_CACHE", "0") != "0"
 
 
 def _empty_cache():
@@ -285,7 +285,7 @@ class W4ActS8:
         out = out.to(self.dtype).reshape(self.orig_shape)
         if (
             not INT4XPULinear._nan_trace_logged
-            and os.environ.get("OMNIXPU_WA4_NAN_TRACE", "0") != "0"
+            and os.environ.get("OMNIXPU_INT4_NAN_TRACE", "0") != "0"
         ):
             if not torch.isfinite(out).all():
                 INT4XPULinear._nan_trace_logged = True
@@ -499,7 +499,7 @@ def _wrap_attn_probe(model):
     旧独立插件用这个把 QW 显存约束在 13-14GB（AIMDO 下也有效）。机制：
     sync 强制 onednn/XPU 异步队列逐层完成，AIMDO 缓存块的 barrier 随之
     完成，ComfyUI 的 soft_empty_cache 才能真正把缓存池释放掉；reset_peak
-    防止 torch 峰值统计被长序列持续推高。OMNIXPU_WA4_PROBE=0 关闭。
+    防止 torch 峰值统计被长序列持续推高。OMNIXPU_INT4_PROBE=0 关闭。
     """
     try:
         from comfy.ldm.qwen_image.model import Attention as QwenAttn
@@ -685,9 +685,9 @@ def _auto_s8_closure(model):
                     # 走 group-wise kernel（scale [M, K/gs] 匹配 onednn_s8u4）。
                     # groupwise kernel：silu(g)*u 直接量化，4x fp16 中间不物化。
                     # 默认关闭（QW 不走此路径；Krea2 类 SwiGLU 需要时显式开
-                    # OMNIXPU_WA4_GROUPWISE=1）。
+                    # OMNIXPU_INT4_GROUPWISE=1）。
                     if (hasattr(int8_ops, "fused_silu_mul_quantize_groupwise")
-                            and _os.environ.get("OMNIXPU_WA4_GROUPWISE", "0") != "0"):
+                            and _os.environ.get("OMNIXPU_INT4_GROUPWISE", "0") != "0"):
                         a8, sc = int8_ops.fused_silu_mul_quantize_groupwise(
                             g.reshape(-1, g.shape[-1]),
                             u.reshape(-1, u.shape[-1]), _gs)
@@ -979,7 +979,7 @@ class INT4XPULinear(nn.Module):
         # ── TINT4 非对称 zp 修正：w=(q-zp)*scale = q'*scale + (8-zp)*scale ──
         if (self._correction is not None
                 and not getattr(self, "_tint4_mode", False)
-                and os.environ.get("OMNIXPU_T4A8_NOCORR", "0") == "0"):
+                and os.environ.get("OMNIXPU_INT4_T4A8_NOCORR", "0") == "0"):
             try:
                 if backend == "w4a16":
                     act_2d = x2.reshape(-1, s[-1])
@@ -1060,7 +1060,7 @@ class INT4XPULinear(nn.Module):
             _sync_point()
             if (
                 not INT4XPULinear._nan_trace_logged
-                and os.environ.get("OMNIXPU_WA4_NAN_TRACE", "0") != "0"
+                and os.environ.get("OMNIXPU_INT4_NAN_TRACE", "0") != "0"
                 and not torch.isfinite(o).all()
             ):
                 INT4XPULinear._nan_trace_logged = True
@@ -1072,7 +1072,7 @@ class INT4XPULinear(nn.Module):
                 )
             if (
                 not INT4XPULinear._nan_trace_logged
-                and os.environ.get("OMNIXPU_WA4_NAN_TRACE", "0") != "0"
+                and os.environ.get("OMNIXPU_INT4_NAN_TRACE", "0") != "0"
                 and torch.isfinite(o).all()
                 and o.numel() > 0
                 and torch.count_nonzero(o) == 0
@@ -1098,7 +1098,7 @@ class INT4XPULinear(nn.Module):
         _sync_point()
         if (
             not INT4XPULinear._nan_trace_logged
-            and os.environ.get("OMNIXPU_WA4_NAN_TRACE", "0") != "0"
+            and os.environ.get("OMNIXPU_INT4_NAN_TRACE", "0") != "0"
             and isinstance(o, torch.Tensor)
             and not torch.isfinite(o).all()
         ):
@@ -1397,7 +1397,7 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
         # 注意：不能用 norm（归一化名会把 transformer_blocks 也归一成 blocks，
         # 与 sd 真实键对不上，导致 AIO 的 bias 全部漏加载）。
         sd_bias = sd.get(f"{base}.bias")
-        if os.environ.get("OMNIXPU_WA4_BIAS_DIAG", "0") != "0" and injected < 3:
+        if os.environ.get("OMNIXPU_INT4_BIAS_DIAG", "0") != "0" and injected < 3:
             _probe = [k for k in sd.keys() if "attn.to_q.bias" in k or "to_q" in k and k.endswith(".bias")]
             log.info(
                 "[int4] bias diag: base=%s norm=%s found_base=%s probe_keys=%s",
@@ -1461,7 +1461,7 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
     if _n_cast:
         log.info("[int4] cast %d unquantized Linear to %s (AIMDO lazy dtype align)",
                  _n_cast, act_dtype)
-    if os.environ.get("OMNIXPU_WA4_BIAS_DIAG", "0") != "0":
+    if os.environ.get("OMNIXPU_INT4_BIAS_DIAG", "0") != "0":
         _n_wl = sum(1 for _m in model.modules() if isinstance(_m, INT4XPULinear))
         _n_wb = sum(1 for _m in model.modules()
                     if isinstance(_m, INT4XPULinear) and _m.bias is not None)
@@ -1721,8 +1721,8 @@ class int4XPUModelLoader:
             INT4XPULinear._prewarm_done = False
             # ── 轻量探针（QW 显存约束，AIMDO 下也装）──
             # 预热已消除采样中的显存爬升（实测无探针也稳定），探针默认关闭；
-            # 需要对比时设 OMNIXPU_WA4_PROBE=1 可临时恢复。
-            if cfg_type == "QwenImage" and os.environ.get("OMNIXPU_WA4_PROBE", "0") != "0":
+            # 需要对比时设 OMNIXPU_INT4_PROBE=1 可临时恢复。
+            if cfg_type == "QwenImage" and os.environ.get("OMNIXPU_INT4_PROBE", "0") != "0":
                 n_probe = _wrap_attn_probe(dm)
                 if n_probe:
                     log.info("[int4] attention probe: %d modules (reset_peak+sync)",
@@ -1733,8 +1733,8 @@ class int4XPUModelLoader:
                     log.info("[int4] QwenImage s8 closure: shared-quant %d attention blocks",
                              n_attn)
                 # GELU s8-out：默认开启（QW 实测稳定路径）。需要 A/B 时设
-                # OMNIXPU_WA4_GELU_S8=0 关闭。
-                if os.environ.get("OMNIXPU_WA4_GELU_S8", "1") != "0":
+                # OMNIXPU_INT4_GELU_S8=0 关闭。
+                if os.environ.get("OMNIXPU_INT4_GELU_S8", "1") != "0":
                     n_gelu = _wrap_qwenimage_gelu_s8(dm)
                     if n_gelu:
                         log.info("[int4] QwenImage s8 closure: gelu s8-out on %d MLPs",
@@ -1747,12 +1747,12 @@ class int4XPUModelLoader:
                 # 通用闭包：任何架构（FLUX/Krea2/ZIT/Boogu/...）按角色识别
                 # 输出投影 s8 + 共享量化 + SwiGLU 融合，边界由 W4ActS8
                 # 张量协议自动反量化。
-                if os.environ.get("OMNIXPU_WA4_AUTO_S8", "1") != "0":
+                if os.environ.get("OMNIXPU_INT4_AUTO_S8", "1") != "0":
                     counts = _auto_s8_closure(dm)
                     log.info("[int4] auto s8 closure: out_s8=%d attn_shared=%d swiglu=%d",
                              counts["out_s8"], counts["attn_shared"], counts["swiglu"])
                 else:
-                    log.info("[int4] auto s8 closure: DISABLED (OMNIXPU_WA4_AUTO_S8=0)")
+                    log.info("[int4] auto s8 closure: DISABLED (OMNIXPU_INT4_AUTO_S8=0)")
         except Exception as e:
             log.warning("[int4] s8 closure setup skipped: %s", e)
 
@@ -1799,11 +1799,11 @@ NODE_CLASS_MAPPINGS = {"int4XPUModelLoader": int4XPUModelLoader}
 NODE_DISPLAY_NAME_MAPPINGS = {"int4XPUModelLoader": "INT4XPU Model Loader v1.4.2n"}
 
 
-# ── 调试：捕获 QW 模型首次前向的真实输入（OMNIXPU_WA4_DUMP_FWD=路径）──
-if os.environ.get("OMNIXPU_WA4_DUMP_FWD"):
+# ── 调试：捕获 QW 模型首次前向的真实输入（OMNIXPU_INT4_DUMP_FWD=路径）──
+if os.environ.get("OMNIXPU_INT4_DUMP_FWD"):
     try:
         import comfy.ldm.qwen_image.model as _qwm
-        _dump_path = os.environ["OMNIXPU_WA4_DUMP_FWD"]
+        _dump_path = os.environ["OMNIXPU_INT4_DUMP_FWD"]
         _orig_qw_fwd = _qwm.QwenImageTransformer2DModel._forward
 
         def _qw_fwd_dump(self, *args, **kwargs):
