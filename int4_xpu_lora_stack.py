@@ -1,5 +1,5 @@
 """
-int4_lora_stack.py — INT4 LoRA Stack v1.3
+int4_xpu_lora_stack.py — INT4XPU LoRA Stack v1.3
 
 v1.3: ADD — AIMDO 兼容防护：AIMDO 活跃时跳过 LoRA 注入
   （实证：AIMDO allocator × LoRA bake = 0xC0000005 崩溃；wa4 让路不覆盖 LoRA 路径）
@@ -11,25 +11,25 @@ v1.1: Multi-LoRA injection (≤8). Same bake rollback + dedup logic as Loader.
 import time, logging
 import torch, torch.nn as nn
 import folder_paths, comfy.utils
-from .int4_loader import int4Linear
-from .int4_lora_common import (
+from .int4_xpu_loader import INT4XPULinear
+from .int4_xpu_lora_common import (
     _wa4_reset_all_loras, _auto_detect_format, _convert_bfl_to_standard,
     _parse_raw_lora_sd, _get_accelerator_device, _rot_quarot_tensor,
     _resolve_with_alias,
 )
-from .int4_lora_loader import _resolve_qkv_slices, _make_bake_pre_hook
+from .int4_xpu_lora_loader import _resolve_qkv_slices, _make_bake_pre_hook
 
 log = logging.getLogger("WA4-LoRA-Stack")
 
 
-class INT4LoRAStack:
-    NAME = "INT4 LoRA Stack"
+class INT4XPULoRAStack:
+    NAME = "INT4XPU LoRA Stack"
     CATEGORY = "wa4"
 
     @classmethod
     def INPUT_TYPES(cls):
         # █ 原样保留 █
-        inp = {"required": {"model": ("MODEL", {"tooltip": "From int4ModelLoader"})}, "optional": {}}
+        inp = {"required": {"model": ("MODEL", {"tooltip": "From int4XPUModelLoader"})}, "optional": {}}
         for i in range(1, 9):
             inp["optional"][f"lora_name_{i}"] = (["None"] + folder_paths.get_filename_list("loras"),)
             inp["optional"][f"strength_{i}"] = ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01})
@@ -47,7 +47,7 @@ class INT4LoRAStack:
 
     def apply(self, model, **kwargs):
         # ★ v1.3 新增：AIMDO 活跃时跳过 LoRA（防 0xC0000005 崩溃）
-        from .int4_aimdo import lora_policy
+        from .int4_xpu_aimdo import lora_policy
         if lora_policy() == "skip":
             _wa4_reset_all_loras(model)
             object.__setattr__(model.model, '_wa4_lora_needs_reset', False)
@@ -80,7 +80,7 @@ class INT4LoRAStack:
 
         H = None
         if quarot_enabled and group_size > 0:
-            from .int4_quarot import build_hadamard
+            from .int4_xpu_quarot import build_hadamard
             H = build_hadamard(group_size, device="cpu", dtype=torch.float32)
 
         if not getattr(model.model, '_wa4_detach_patched', False):
@@ -119,7 +119,7 @@ class INT4LoRAStack:
                         key = mid if qkv_slice is None else (mid, target_path)
                         if key in seen: continue
                         seen.add(key)
-                        is_quant = isinstance(module, int4Linear)
+                        is_quant = isinstance(module, INT4XPULinear)
                         is_linear = isinstance(module, nn.Linear)
                         if not is_quant and not is_linear: continue
                         self._pop_module_lora(module, lora_name)
@@ -157,7 +157,7 @@ class INT4LoRAStack:
     @staticmethod
     def _pop_module_lora(module, lora_name):
         # █ 原样保留（baked delta 回滚，不动）█
-        if isinstance(module, int4Linear):
+        if isinstance(module, INT4XPULinear):
             le = getattr(module, '_wa4_lora_entries', None)
             if le is not None:
                 le.pop(lora_name, None)
@@ -212,8 +212,8 @@ class INT4LoRAStack:
         # █ 原样保留 █
         w1_c = w1.to(cpu, torch.float16).clone(); w2_c = w2.to(cpu, torch.float16).clone()
         delta = torch.kron(w1_c, w2_c)
-        to2 = module.out_features if isinstance(module, int4Linear) else module.weight.shape[0]
-        ti2 = module.in_features if isinstance(module, int4Linear) else module.weight.shape[1]
+        to2 = module.out_features if isinstance(module, INT4XPULinear) else module.weight.shape[0]
+        ti2 = module.in_features if isinstance(module, INT4XPULinear) else module.weight.shape[1]
         if delta.shape[0] < to2: delta = delta.repeat((to2 + delta.shape[0] - 1) // delta.shape[0], 1)
         if delta.shape[0] > to2: delta = delta[:to2, :]
         if delta.shape[1] < ti2: delta = delta.repeat(1, (ti2 + delta.shape[1] - 1) // delta.shape[1])
@@ -242,6 +242,6 @@ class INT4LoRAStack:
                 le.setdefault(lora_name, []).append(("delta", delta, strength))
 
 
-NODE_CLASS_MAPPINGS = {"INT4LoRAStack": INT4LoRAStack}
-NODE_DISPLAY_NAME_MAPPINGS = {"INT4LoRAStack": "INT4 LoRA Stack (up to 8)"}
+NODE_CLASS_MAPPINGS = {"INT4XPULoRAStack": INT4XPULoRAStack}
+NODE_DISPLAY_NAME_MAPPINGS = {"INT4XPULoRAStack": "INT4XPU LoRA Stack (up to 8)"}
 

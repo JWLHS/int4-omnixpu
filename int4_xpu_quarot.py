@@ -1,5 +1,5 @@
 """
-int4_quarot.py
+int4_xpu_quarot.py
 ───────────────
 Group-wise Hadamard rotation for INT8 quantization quality improvement.
 

@@ -56,7 +56,7 @@ kernel 分 A/B 两个系列，按你的平台选对应的仓库编译 wheel 后�
 >   更快。
 > - **差异**：非对称 per-block zero point 能把偏置的权重分布逐块归中，
 >   相比对称 INT4 量化误差更小（编辑/姿态迁移类能力保留更好）。
-> - **使用差异**：tint4 文件用本插件的 `int4ModelLoader`（backend=w4a16）
+> - **使用差异**：tint4 文件用本插件的 `wa4ModelLoader`（backend=w4a16）
 >   直接加载即可，不需要装 ComfyUI-TINT4 加载器；两套可以共存，不会冲突。
 
 下载后把模型放到 `ComfyUI/models/diffusion_models/` 下（可自建子目录），
@@ -64,18 +64,18 @@ kernel 分 A/B 两个系列，按你的平台选对应的仓库编译 wheel 后�
 
 ## 使用方式
 
-1. 按上面选一个系列的 kernel 编译安装。
+1. 按自己显卡型号选择对应系列：A770/DG2 用 **A 系列**，其余（BMG/PTL-H）用 **B 系列**，按该系列仓库 README 编译安装 kernel。
 2. 把本插件放进 `ComfyUI/custom_nodes/`。
 3. 模型放入 `models/diffusion_models/`。
-4. 工作流中用 **int4ModelLoader** 节点：`unet_name` 选模型文件，
+4. 工作流中用 **wa4ModelLoader** 节点：`unet_name` 选模型文件，
    `backend` 选 **w4a16**。
 
 节点一览：
 
-- **int4ModelLoader**：wa4 / tint4 统一加载（当前正式版 backend 仅 w4a16；
+- **wa4ModelLoader**：wa4 / tint4 统一加载（当前正式版 backend 仅 w4a16；
   a8/a4 隐藏待开发）。
-- **int4ModelQuantizer**：把 fp16/bf16/fp8/int8 模型量化为 wa4 格式。
-- **INT4 LoRA Loader / Stack**：LoRA 注入（GPU 侧缓存，避免逐层 H2D 造成
+- **wa4ModelQuantizer**：把 fp16/bf16/fp8/int8 模型量化为 wa4 格式。
+- **wa4 LoRA Loader / Stack**：LoRA 注入（GPU 侧缓存，避免逐层 H2D 造成
   CPU 高占用）。
 
 ## 后端回退（安全兜底）
@@ -122,18 +122,18 @@ kernel，但保证可用、不中断。
 | `OMNIXPU_WA4_BIAS_DIAG` | 0 | bias 加载诊断日志 |
 | `OMNIXPU_RAM_TRACE` | 0 | 内存采样日志 |
 
-**以下变量属于 A 系列 kernel / ComfyUI-OmniXPU 插件**（不是本插件的），
-常见配置与含义：
+**以下变量属于 A 系列 kernel / ComfyUI-OmniXPU 插件**（不是本插件的）。
+表格先给**原仓库默认值**，再给**我们本地测试用的参数（仅参考）**及原因：
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `OMNIXPU_ATTN_NAN_CHECK` | 0 | A 系列 kernel ESIMD attention 的 fp16 NaN 全扫开关；默认关（提速），安全排查时开 1 |
-| `OMNIXPU_SDP_CACHE_AUTOCLEAR` | keep | A 系列 sdp 侧车缓存跨模型卸载是否保留；默认 keep 避免每轮重编 |
-| `OMNIXPU_ATTENTION` / `OMNIXPU_NORM` | 1 | ComfyUI-OmniXPU 的 attention/norm 加速开关；默认开，设 0 关闭 |
+| 变量 | 原仓库默认 | 我们本地测试参数（参考） | 含义 |
+|---|---|---|---|
+| `OMNIXPU_ATTN_NAN_CHECK` | 1（开） | 0 | A 系列 kernel ESIMD attention 的 fp16 NaN 全扫开关。原仓库默认开（安全）；本地测试关掉提速，排查黑图/NaN 时再开回 1 |
+| `OMNIXPU_SDP_CACHE_AUTOCLEAR` | clear | keep | A 系列 sdp sidecar 缓存跨模型卸载是否保留。原仓库默认每轮清（省显存）；本地测试 keep 避免每轮重新编译 |
+| `OMNIXPU_ATTENTION` / `OMNIXPU_NORM` | 1 | 1 | ComfyUI-OmniXPU 的 attention/norm 加速开关；默认开，设 0 关闭 |
 
-> 这些变量的具体默认值以你安装的 kernel/插件仓库 README 为准；本插件只保证
-> **kernel 装上后零环境变量直接可用**。上面"最快生图"的配置仅作参考，不设
-> 也不影响正确性。
+> 使用原则：**不设任何变量也能正常用**（按原仓库默认）。我们本地的参数只是
+> 为了最快生图/调试，按需参考，不是必需。具体默认以你安装的 kernel/插件
+> 仓库 README 为准。
 
 ## 已知边界
 

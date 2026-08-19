@@ -1,5 +1,5 @@
 """
-INT4 Model Quantizer v1.0
+INT4XPU Model Quantizer v1.0
 — FP16/BF16/FP32/FP8/INT8 → INT4 per-group absmax quantization.
 Auto-strips embedded VAE/CLIP, cleans residual FP8.
 
@@ -194,7 +194,7 @@ def _should_quantize(key, tensor, mt):
 
 def _get_hadamard(gs, device="cpu"):
 	try:
-		from .int4_quarot import build_hadamard
+		from .int4_xpu_quarot import build_hadamard
 		return build_hadamard(gs, device=device, dtype=torch.float32)
 	except ImportError:
 		return None
@@ -202,7 +202,7 @@ def _get_hadamard(gs, device="cpu"):
 
 def _rotate_weight_tensor(w, H, gs):
 	try:
-		from .int4_quarot import rotate_weight
+		from .int4_xpu_quarot import rotate_weight
 		return rotate_weight(w, H, gs)
 	except ImportError:
 		return w
@@ -229,7 +229,7 @@ def _quantize_weight(w):
 	raise ValueError(f"in_features {i}: no usable group_size")
 
 
-class int4ModelQuantizer:
+class int4XPUModelQuantizer:
 	@classmethod
 	def INPUT_TYPES(s):
 		return {
@@ -247,7 +247,7 @@ class int4ModelQuantizer:
 	RETURN_TYPES = ()
 	FUNCTION = "quantize"
 	CATEGORY = "wa4"
-	TITLE = "INT4 Model Quantizer v1.0"
+	TITLE = "INT4XPU Model Quantizer v1.0"
 	OUTPUT_NODE = True
 
 	def quantize(self, unet_name, model_type, output_filename, device,
@@ -343,5 +343,5 @@ class int4ModelQuantizer:
 		return ()
 
 
-NODE_CLASS_MAPPINGS = {"int4ModelQuantizer": int4ModelQuantizer}
-NODE_DISPLAY_NAME_MAPPINGS = {"int4ModelQuantizer": "INT4 Model Quantizer v1.0"}
+NODE_CLASS_MAPPINGS = {"int4XPUModelQuantizer": int4XPUModelQuantizer}
+NODE_DISPLAY_NAME_MAPPINGS = {"int4XPUModelQuantizer": "INT4XPU Model Quantizer v1.0"}

@@ -1,5 +1,5 @@
 """
-int4_aimdo.py — WA4 × AIMDO XPU 管控 v1.3
+int4_xpu_aimdo.py — WA4 × AIMDO XPU 管控 v1.3
 
 v1.3:
   - lora_policy() 恒返回 'normal'：LoRA 与模型一体，始终注入
