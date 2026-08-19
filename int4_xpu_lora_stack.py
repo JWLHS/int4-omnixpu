@@ -1,7 +1,6 @@
 """
 int4_xpu_lora_stack.py — INT4XPU LoRA Stack v1.3
 
-v1.3: ADD — AIMDO 兼容防护（lora_policy 恒 normal 后无实际阻断，保留调用点）
 v1.2: FIX — QKV 融合层 seen 条件化（与 loader v3.3 一致）：
   slice 有效 → (module, target) 三段注入；slice 无效(None) → module 去重
   （_make_bake_pre_hook / _resolve_qkv_slices 从 loader 导入，已含形状自适应修复）
@@ -45,13 +44,6 @@ class INT4XPULoRAStack:
     FUNCTION = "apply"
 
     def apply(self, model, **kwargs):
-        # ★ v1.3 新增：AIMDO 活跃时跳过 LoRA（防 0xC0000005 崩溃）
-        from .int4_xpu_aimdo import lora_policy
-        if lora_policy() == "skip":
-            _wa4_reset_all_loras(model)
-            object.__setattr__(model.model, '_wa4_lora_needs_reset', False)
-            return (model,)
-
         to_apply = []
         for i in range(1, 9):
             n = kwargs.get(f"lora_name_{i}")

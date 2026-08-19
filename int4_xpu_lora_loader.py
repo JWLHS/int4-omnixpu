@@ -4,7 +4,6 @@ int4_xpu_lora_loader.py — INT4XPU LoRA Loader v3.5
 v3.5: FIX — bake 纳入 AIMDO 管理：
   克隆新权重张量（AIMDO allocator 分配）→ 段加 delta → 整体换权重
   不再对已有权重页原地写（原地写绕过 AIMDO/VBAR 管理 → 0xC0000005 崩溃面）
-v3.4: ADD — AIMDO 兼容防护（lora_policy 恒 normal 后无实际阻断，保留调用点）
 v3.3: FIX — QKV 融合层通用修复：
   1. seen 去重条件化：slice 有效 → (module, target) 三段注入（融合层 q/k/v 都生效）
                       slice 无效(None) → module 去重（保留原版防重复注入）
@@ -137,12 +136,6 @@ class INT4XPULoRALoader:
     FUNCTION = "load_lora"
 
     def load_lora(self, model, lora_name, strength):
-        # ★ AIMDO 兼容：lora_policy 恒 normal（v1.3），不阻断注入
-        from .int4_xpu_aimdo import lora_policy
-        if lora_policy() == "skip":
-            _wa4_reset_all_loras(model)
-            object.__setattr__(model.model, '_wa4_lora_needs_reset', False)
-            return (model,)
         if getattr(model.model, '_wa4_lora_needs_reset', False):
             _wa4_reset_all_loras(model)
             object.__setattr__(model.model, '_wa4_lora_needs_reset', False)

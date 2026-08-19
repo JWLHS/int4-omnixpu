@@ -1,12 +1,8 @@
 """
-int4_xpu_aimdo.py — WA4 × AIMDO XPU 管控 v1.3
+int4_xpu_aimdo.py — int4 × AIMDO XPU 管控
 
-v1.3:
-  - lora_policy() 恒返回 'normal'：LoRA 与模型一体，始终注入
-    （LoRA 的 A/B/delta/写回全部经 AIMDO allocator 分配，纳入 AIMDO 管理，模型管控状态不变）
 v1.2:
-  - 新增 aimdo_active() 统一查询（loader / LoRA 共用）
-  - lora_policy() 曾为 AIMDO 跳过策略——已废弃（实测环境已兼容）
+  - 新增 aimdo_active() 统一查询（loader 共用）
   - devctxs 读取 getattr 加固
 v1.1:
   - 检测 AIMDO（只认 XPU 实现 aimdo_xpu；cuda/rocm 无效依赖不理会）
@@ -38,11 +34,6 @@ def aimdo_state() -> str:
 def aimdo_active() -> bool:
     """统一查询：AIMDO 是否活跃"""
     return aimdo_state() == "active"
-
-
-def lora_policy() -> str:
-    """LoRA 与模型一体：始终正常注入（AIMDO 管控显存，LoRA 走 AIMDO 分配）"""
-    return "normal"
 
 
 def patch_aimdo_xpu(model) -> bool:
