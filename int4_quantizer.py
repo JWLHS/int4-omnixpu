@@ -148,6 +148,10 @@ _EXCLUSIONS = {
 	"seedvr2": [
 		"x_embedder", "final_layer",
 	],
+	"h3": [
+		"adaln_proj", "video_patch_proj", "audio_patch_proj",
+		"condition_proj", "final_layer", "time_embedder", "time_embed",
+	],
 	"auto": [],
 }
 
@@ -163,6 +167,7 @@ MODEL_TYPES = [
 	"qwen (Qwen Image)", "ernie (Ernie Image)", "hidream (HiDream Full)",
 	"boogu (Boogu)", "krea2 (Krea 2)", "ideogram4 (Ideogram 4)",
 	"anima (Anima / Cosmos Predict2)", "auto (Auto-detect)",
+	"h3 (MiniMax H3)",
 ]
 
 
