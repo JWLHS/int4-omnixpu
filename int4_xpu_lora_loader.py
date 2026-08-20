@@ -147,6 +147,20 @@ class INT4XPULoRALoader:
         if lora_path is None:
             raise FileNotFoundError(f"[int4 LoRA] '{lora_name}' not found")
 
+        # 同 LoRA 同强度已注入 → 直接跳过（避免每轮重建 entries + GPU 缓存，
+        # 实测每轮重注入会让 XPU 分配器碎片化、显存逐轮 +~250MB）
+        _prev = getattr(model.model, "_wa4_loras", None) or []
+        if any(
+            isinstance(x, dict)
+            and x.get("name") == lora_name
+            and x.get("path") == lora_path
+            and abs(float(x.get("strength", 1.0)) - float(strength)) < 1e-5
+            for x in _prev
+        ):
+            log.info("[int4 LoRA] ✓ %s 已按 strength=%.2f 注入，跳过重复注入",
+                     lora_name, strength)
+            return (model,)
+
         base_model = model.model
         while hasattr(base_model, '_orig_mod'): base_model = base_model._orig_mod
         quarot_enabled = bool(getattr(base_model, '_wa4_quarot_enabled', False))

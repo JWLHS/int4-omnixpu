@@ -86,8 +86,19 @@ class INT4XPULoRAStack:
 
         total_t0 = time.perf_counter()
         total_aq, total_ab = 0, 0
+        prev_applied = getattr(model.model, "_wa4_loras", None) or []
 
         for lora_name, lora_path, strength in to_apply:
+            # 同 LoRA 同强度已注入 → 跳过（避免每轮重建 entries + GPU 缓存碎片化）
+            if any(
+                isinstance(x, dict)
+                and x.get("name") == lora_name
+                and x.get("path") == lora_path
+                and abs(float(x.get("strength", 1.0)) - float(strength)) < 1e-5
+                for x in prev_applied
+            ):
+                log.info("[int4 Stack] %s 已按 strength=%.2f 注入，跳过", lora_name, strength)
+                continue
             t0 = time.perf_counter()
             lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
             fmt = _auto_detect_format(lora_sd)
