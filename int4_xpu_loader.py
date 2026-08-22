@@ -1567,10 +1567,10 @@ class int4XPUModelLoader:
             # w4a4 暂屏蔽：层间 INT4 激活传递未实现（见 INT4XPULinear.forward）。
             # w4a8-s8(88) 已从 UI 移除：实测比 84 慢且权重内存 x2，无保留价值；
             # 源码路径保留（backend="w4a8-s8" 仍可用）供开发对比。
-            # 正式版默认只暴露 w4a16；开发版设 OMNIXPU_DEV_BACKENDS=1
-            # 解锁 w4a8（a4 预留，层间 INT4 传递实现后开放）。
-            "backend": (["w4a16", "w4a8"] if os.environ.get("OMNIXPU_DEV_BACKENDS", "0") != "0" else ["w4a16"],
-                        {"default": "w4a16"}),
+            # w4a8 随 kernel PR 开放；kernel 缺 onednn_s8u4_gemm 时
+            # _resolve_backend 自动逐级回退 w4a16。a4 预留，层间 INT4
+            # 传递实现后开放。
+            "backend": (["w4a16", "w4a8"], {"default": "w4a16"}),
         }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_model"
