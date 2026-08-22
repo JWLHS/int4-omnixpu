@@ -28,6 +28,7 @@ _AIMDO_EMPTY_TRACE = os.environ.get("OMNIXPU_INT4_EMPTY_TRACE", "0") != "0"
 _TIMING = os.environ.get("OMNIXPU_INT4_TIMING", "0") != "0"
 _TINT4_NATIVE = os.environ.get("OMNIXPU_INT4_TINT4_NATIVE", "1") != "0"
 _LOAD_T0 = 0.0
+_TAO_ERR_PRINTED = False
 
 
 def _kernel_caps():
@@ -43,10 +44,10 @@ def _kernel_caps():
             hasattr(svdq, "onednn_int4_gemm_preconverted")
             or hasattr(svdq, "onednn_int4_gemm")
         )
-        # tint4 原生：A 系列 fork 有独立 onednn_int4_gemm_tint4；
+        # tint4 原生：A 系列 fork 有独立 onednn_int4_gemm_torchao；
         # B 系列（原仓库 PR）是 onednn_int4_gemm_preconverted 带 zp 参数。
         caps["tint4"] = (
-            hasattr(svdq, "onednn_int4_gemm_tint4")
+            hasattr(svdq, "onednn_int4_gemm_torchao")
             or hasattr(svdq, "onednn_int4_gemm_preconverted")
         )
     except Exception:
@@ -123,6 +124,7 @@ class Int4LinearPython(nn.Module):
         return w.to(self._act_dtype)
 
     def forward(self, x):
+        global _TAO_ERR_PRINTED
         dev = x.device
         x2 = x.reshape(-1, x.shape[-1]).to(self._act_dtype)
         if self._use_quarot and self._hadamard_H is not None:
@@ -187,6 +189,10 @@ class Int4LinearTorchao(nn.Module):
         except Exception as _tao_e:
             # torchao 缺失/过旧时的纯 python 回退：
             # 解包 nibbles -> w = (q - zp) * scale -> F.linear。
+            if not _TAO_ERR_PRINTED:
+                log.warning("[int4] tint4 torchao path failed (%s: %r), using python dequant",
+                            type(_tao_e).__name__, _tao_e)
+                _TAO_ERR_PRINTED = True
             w = self._python_dequant(dev)
             out = F.linear(x2, w)
         entries = self._wa4_lora_entries
@@ -862,7 +868,7 @@ class INT4XPULinear(nn.Module):
         # TINT4 非对称 zp 修正项 [N] f32（None = 对称 wa4 模型）
         object.__setattr__(self, "_correction", correction)
         # TINT4 原生模式：raw u4 字节视图 + per-block zp，直接喂
-        # onednn_int4_gemm_tint4（无转换、无修正项）
+        # onednn_int4_gemm_torchao（无转换、无修正项）
         object.__setattr__(self, "_zp", zp)
         object.__setattr__(self, "_tint4_mode", bool(tint4_mode))
         # LoRA GPU 缓存：(tensor_map, id(entries), (dev, dtype))——LoRA 权重
@@ -1026,10 +1032,10 @@ class INT4XPULinear(nn.Module):
                     pass
             if getattr(self, "_tint4_mode", False):
                 # TINT4 原生：per-block zp 在 oneDNN 内应用，w=(q-zp)*scale
-                # A 系列 fork：独立 onednn_int4_gemm_tint4 / torchao 名；
+                # A 系列 fork：独立 onednn_int4_gemm_torchao / torchao 名；
                 # B 系列（原仓库 PR）：onednn_int4_gemm_preconverted 的 zp 参数。
-                if hasattr(svdq, "onednn_int4_gemm_tint4"):
-                    o = svdq.onednn_int4_gemm_tint4(
+                if hasattr(svdq, "onednn_int4_gemm_torchao"):
+                    o = svdq.onednn_int4_gemm_torchao(
                         x2, self._w_packed, self._zp, self._w_s)
                 elif hasattr(svdq, "onednn_int4_gemm_torchao"):
                     o = svdq.onednn_int4_gemm_torchao(
@@ -1061,9 +1067,16 @@ class INT4XPULinear(nn.Module):
                 o = svdq.onednn_s8s8_gemm(a8, xsc, self._w_s8, self._w_s,
                                           self._act_dtype)
             else:
-                o = svdq.onednn_s8u4_gemm(a8, xsc,
-                                          self._w_packed, self._w_s,
-                                          self._act_dtype)
+                if (getattr(self, "_tint4_mode", False)
+                        and getattr(self, "_zp", None) is not None):
+                    # tint4 非对称：per-block zp 原生传入 oneDNN
+                    o = svdq.onednn_s8u4_gemm(a8, xsc,
+                                              self._w_packed, self._w_s,
+                                              self._act_dtype, self._zp)
+                else:
+                    o = svdq.onednn_s8u4_gemm(a8, xsc,
+                                              self._w_packed, self._w_s,
+                                              self._act_dtype)
 
         # ── TINT4 非对称 zp 修正：w=(q-zp)*scale = q'*scale + (8-zp)*scale ──
         if (self._correction is not None
@@ -1307,12 +1320,15 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
                     if norm is None:
                         continue
                     if (
-                        backend == "w4a16"
+                        backend in ("w4a16", "w4a8")
                         and mode in ("kernel", "torchao")
                         and (_TINT4_NATIVE or mode == "torchao")
                     ):
-                        # 原生模式（a16）：raw int32 qdata（_prepare 里 view 成
-                        # u4）+ per-block zp + fp16 scale，零转换、零 GPU 往返。
+                        # 原生模式（a16/a8）：raw int32 qdata（_prepare 里 view
+                        # 成 u4）+ per-block zp + fp16 scale，零转换、零 GPU 往返。
+                        # a8 由 onednn_s8u4_gemm 的 per-block zp 原生处理
+                        # （w=(q-zp)*scale 在 oneDNN 内完成），无修正项。
+                        # torchao 回退也用同样的 raw 数据。
                         # torchao 回退也用同样的 raw 数据。
                         scale_wa4 = sc_t.to(torch.float16).contiguous()
                         zp_u8 = zp_t.to(torch.uint8).contiguous()
@@ -1639,10 +1655,9 @@ class int4XPUModelLoader:
                     pass
             if _t4_gs > 64:
                 log.warning(
-                    "[int4] tint4 权重 gs=%d：onednn s8u4 在 gs>64 下输出错误"
-                    "（实测 corr~0.1，非崩溃但数值错），自动回退 w4a16；"
-                    "用小 gs（32/64）重新量化即可走 a8", _t4_gs)
-                backend = "w4a16"
+                    "[int4] tint4 权重 gs=%d：走 src/wei 解耦 a8 路径"
+                    "（act_gs=64 / wei_gs=%d；2026-08-22 实测 corr 0.9946 通过）",
+                    _t4_gs, _t4_gs)
         _mode = "kernel"  # kernel 原生（wa4 或 tint4）
         backend = _resolve_backend(backend, caps)
         if backend == "w4a16":
