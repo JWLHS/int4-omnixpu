@@ -1528,6 +1528,17 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
         if isinstance(_m, nn.Linear) and not isinstance(_m, INT4XPULinear):
             if _m.weight is not None and _m.weight.dtype != act_dtype:
                 _m.weight.data = _m.weight.data.to(act_dtype)
+                # 同步归档 dtype：ComfyUI vbar cast 路径按 weight._model_dtype
+                # 生成 geometry，若保留模型原始 fp32 归档 dtype，会与实权重
+                # (fp16) 产生 2× 缓冲错位 → "Buffer too small: needs 62914560,
+                # has 31469568"（txtmlp 等未量化层 + 风情万种 LoRA 实测）。
+                try:
+                    if hasattr(_m.weight, "_model_dtype"):
+                        _m.weight._model_dtype = act_dtype
+                    if hasattr(_m, "weight_comfyn"):
+                        _m.weight_comfyn = act_dtype
+                except Exception:
+                    pass
                 _n_cast += 1
             if _m.bias is not None and _m.bias.dtype != act_dtype:
                 _m.bias.data = _m.bias.data.to(act_dtype)

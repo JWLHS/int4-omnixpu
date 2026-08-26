@@ -46,62 +46,75 @@ def _resolve_qkv_slices(index, norm):
 
 # ── Pre-hook for nn.Linear bake ──────────────────────────────
 
+def _sync_baked_dtype(module, dtype):
+    """Align archive dtype so ComfyUI's vbar cast geometry matches the real
+    (fp16) weight — otherwise the 2x geometry mismatch raises
+    "Buffer too small" on the txtmlp-class unquantized layers."""
+    try:
+        w = module.weight
+        if w is not None:
+            if hasattr(w, "_model_dtype"):
+                w._model_dtype = dtype
+            if hasattr(module, "weight_comfyn"):
+                module.weight_comfyn = dtype
+    except Exception:
+        pass
+
+
+def _apply_bake_entry(w_new, entry, w_dtype):
+    """Apply one bake entry onto the cloned weight; returns
+    (delta_cpu_fp16, sl, se) for rollback, or None on shape mismatch."""
+    if len(entry) >= 3 and isinstance(entry[0], str) and entry[0] == "delta":
+        _, delta_cpu, mult = entry[:3]
+        sl = entry[3] if len(entry) > 3 else None
+        se = entry[4] if len(entry) > 4 else None
+        delta_gpu = delta_cpu.to(device=w_new.device, dtype=w_dtype).mul_(mult)
+    else:
+        A_cpu, B_cpu, mult = entry[:3]
+        sl = entry[3] if len(entry) > 3 else None
+        se = entry[4] if len(entry) > 4 else None
+        if sl is not None and se is not None and B_cpu.shape[0] != (se - sl):
+            B_cpu = B_cpu[sl:se].contiguous()
+        A_gpu = A_cpu.to(device=w_new.device, dtype=w_dtype)
+        B_gpu = B_cpu.to(device=w_new.device, dtype=w_dtype)
+        delta_gpu = (B_gpu @ A_gpu).mul_(mult)
+
+    target_rows = (se - sl) if (sl is not None and se is not None) else w_new.shape[0]
+    if delta_gpu.shape[0] == target_rows:
+        if sl is not None and se is not None:
+            w_new[sl:se] += delta_gpu
+        else:
+            w_new += delta_gpu
+    elif delta_gpu.shape[0] % target_rows == 0:
+        n = delta_gpu.shape[0] // target_rows
+        base_sl = sl if sl is not None else 0
+        for i in range(n):
+            seg = slice(base_sl + i * target_rows, base_sl + (i + 1) * target_rows)
+            w_new[seg] += delta_gpu[i * target_rows:(i + 1) * target_rows]
+    else:
+        log.warning(f"[int4 LoRA] shape mismatch delta={tuple(delta_gpu.shape)} "
+                    f"target={tuple(w_new.shape)} — skip")
+        return None
+    return (delta_gpu.to(device=torch.device("cpu"), dtype=torch.float16).clone(), sl, se)
+
+
 def _make_bake_pre_hook(module: nn.Module):
     def _pre_hook(_mod, _inputs):
         bs = getattr(module, '_wa4_bake_state', None)
         if bs is None: return
         pending = bs.get('_pending')
         if not pending: return
-        w_dev = module.weight.device
         w_dtype = module.weight.dtype
-        cpu = torch.device("cpu")
         applied = []
         try:
             # v3.5：克隆新权重（AIMDO 分配），全部 delta 在克隆张量上操作，最后整体换权重
             w_new = module.weight.detach().clone()
             for entry in pending:
-                # ── lokr "delta" entry: ("delta", delta_matrix, mult, sl, se) ──
-                if len(entry) >= 3 and isinstance(entry[0], str) and entry[0] == "delta":
-                    _, delta_cpu, mult = entry[:3]
-                    sl = entry[3] if len(entry) > 3 else None
-                    se = entry[4] if len(entry) > 4 else None
-                    delta_gpu = delta_cpu.to(device=w_dev, dtype=w_dtype).mul_(mult)
-                # ── standard entry: (A_cpu, B_cpu, mult, sl, se) ──
-                else:
-                    A_cpu, B_cpu, mult = entry[:3]
-                    sl = entry[3] if len(entry) > 3 else None
-                    se = entry[4] if len(entry) > 4 else None
-                    if sl is not None and se is not None and B_cpu.shape[0] != (se - sl):
-                        B_cpu = B_cpu[sl:se].contiguous()
-                    A_gpu = A_cpu.to(device=w_dev, dtype=w_dtype)
-                    B_gpu = B_cpu.to(device=w_dev, dtype=w_dtype)
-                    delta_gpu = (B_gpu @ A_gpu).mul_(mult)
-
-                # ── Apply delta（v3.5：克隆张量上段加，不原地写现有权重页）──
-                if sl is not None and se is not None:
-                    target_rows = se - sl
-                else:
-                    target_rows = w_new.shape[0]
-
-                if delta_gpu.shape[0] == target_rows:
-                    if sl is not None and se is not None:
-                        w_new[sl:se] += delta_gpu
-                    else:
-                        w_new += delta_gpu
-                elif delta_gpu.shape[0] % target_rows == 0:
-                    # 融合层：delta 是 N 个 head 拼接，逐段加进克隆张量
-                    n = delta_gpu.shape[0] // target_rows
-                    base_sl = sl if sl is not None else 0
-                    for i in range(n):
-                        seg = slice(base_sl + i * target_rows,
-                                    base_sl + (i + 1) * target_rows)
-                        w_new[seg] += delta_gpu[i * target_rows:(i + 1) * target_rows]
-                else:
-                    log.warning(f"[int4 LoRA] shape mismatch delta={tuple(delta_gpu.shape)} "
-                                f"target={tuple(module.weight.shape)} — skip")
-                    continue
-                applied.append((delta_gpu.to(device=cpu, dtype=torch.float16).clone(), sl, se))
+                r = _apply_bake_entry(w_new, entry, w_dtype)
+                if r is not None:
+                    applied.append(r)
             module.weight = nn.Parameter(w_new)   # 换新权重（AIMDO 分配），原页由 AIMDO 回收
+            _sync_baked_dtype(module, w_dtype)
         except Exception as e:
             log.warning("[int4 LoRA] bake pre-hook failed: %s", e)
         bs.pop('_pending', None)
