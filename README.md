@@ -114,6 +114,13 @@ torchao；无 kernel 时自动回退到 torchao 路径，功能完整、速度�
 - **INT4XPU LoRA Loader / Stack**：LoRA 注入（GPU 侧缓存，避免逐层 H2D 造成
   CPU 高占用）。
 
+> **AIMDO 兼容（bake 路径）**：启用 AIMDO（`--enable-dynamic-vram`）时，含
+> bake 的 LoRA（把 delta 合并进未量化层权重，如 krea2 风格/编辑类）会在
+> CPU 上合成 delta，并在换权时对齐到模型计算 dtype。这样可规避两个 AIMDO
+> 环境问题：① GPU 小 GEMM（`B@A`）慢 100~1000 倍导致的采样器前长等待
+> （实测每层 2~6s → 毫秒级）；② AIMDO 懒加载下 F32 未量化层与 vbar fp16
+> 缓冲错位导致的 `Buffer too small`。未启用 AIMDO 时走原 GPU 路径，行为不变。
+
 ## 后端开启说明（w4a8 / w4a4）
 
 `int4XPUModelLoader` 的 `backend` 下拉已开放 **w4a8** 与 **w4a4**（默认

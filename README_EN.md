@@ -133,6 +133,16 @@ Nodes:
 - **INT4XPU LoRA Loader / Stack**: LoRA injection (GPU-side cache, avoiding
   per-layer H2D CPU spikes).
 
+> **AIMDO compatibility (bake path)**: when AIMDO is enabled
+> (`--enable-dynamic-vram`), LoRAs that bake (merge delta into unquantized
+> layer weights, e.g. krea2 style/edit sets) synthesize the delta on the CPU
+> and align it to the model compute dtype on weight replacement. This avoids
+> two AIMDO-environment issues: ① GPU small GEMMs (`B@A`) being 100–1000×
+> slower, causing a long pre-sampler wait (measured 2–6 s per layer → ms);
+> ② the `Buffer too small` crash from AIMDO lazy-loading F32 unquantized
+> layers against fp16 vbar buffers. Without AIMDO the original GPU path is
+> used and behavior is unchanged.
+
 ## Enabling w4a8 / w4a4
 
 The `backend` dropdown of `int4XPUModelLoader` now exposes **w4a8** and
