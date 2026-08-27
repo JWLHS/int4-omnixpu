@@ -42,13 +42,34 @@ kernel 分 A/B 两个系列，按你的平台选对应的仓库编译 wheel 后�
 
 **torchao** 是 INT4 非对称量化格式（`Int4PlainInt32Tensor`）的后端实现，
 也是 tint4/torchao 格式模型**无 kernel 时的回退运行路径**。插件启动时会
-自动检测：本插件需要的 torchao 缺失或过旧时，自动执行
+自动检测：本插件需要的 torchao 缺失或过旧（<0.17）时，自动执行
 `pip install torchao --isolated --index-url https://download.pytorch.org/whl/xpu`
-（与 tint4 原插件同款机制）。
+（与 tint4 原插件同款机制）。**不强制固定 torchao 版本**——0.17 / 0.18+
+均可，由你自行取舍。
 
 目的：**保证 tint4 模型即使在没有 kernel（或 kernel 缺算子）的机器上也能
 直接加载运行**，不要求用户手动装 torchao。有 kernel 时原生加速、无需
 torchao；无 kernel 时自动回退到 torchao 路径，功能完整、速度较慢。
+
+> **依赖联动风险（来自 GitHub issue）**：torchao 0.18+ 移除了
+> `torchao.dtypes` 下的旧符号（`NF4Tensor` 等）。若环境中的 `diffusers`
+> 低于 0.37.1，其 `torchao_quantizer` 会引用旧符号并触发 `logger` 作用域
+> bug，导致任何 `import diffusers` 的第三方插件（SeedVR2、WanVideoWrapper、
+> Easy-Use 等）在 XPU 环境 `IMPORT FAILED`。**本插件自身不 import
+> diffusers、不受影响**（走 `quantize_.workflows` 新路径，0.17/0.18 均兼容）。
+>
+> **本插件只做最低保险**：`requirements.txt` 声明 `diffusers>=0.37.1`
+> （官方已在该版本修复此问题），不强制、不覆盖你环境里已装的 diffusers。
+> 取舍建议：
+> - 保持默认：torchao 随 XPU index 装最新（当前 0.18+），并保证
+>   `diffusers>=0.37.1` —— 两者兼容，最省心；
+> - 想用旧 torchao：装 `torchao==0.17.0` 也可，但 diffusers 版本建议仍
+>   保持 >=0.37.1（0.17 同样缺旧符号，只是影响面不同）；
+> - 升级到更高版本：可以，但可能连带更新其他依赖（如 huggingface-hub
+>   等），请自行评估。
+>
+> 若你的环境出现 `IMPORT FAILED`，先执行
+> `pip install -U "diffusers>=0.37.1"` 即可解决。
 
 ## 模型下载
 

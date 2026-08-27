@@ -61,6 +61,28 @@ with a kernel missing the ops)** — no manual torchao install required. With
 a kernel you get native acceleration; without one you fall back to the
 torchao path (complete functionality, slower).
 
+> **Dependency risk (from a GitHub issue)**: torchao 0.18+ removed the old
+> symbols under `torchao.dtypes` (e.g. `NF4Tensor`). If your `diffusers` is
+> below 0.37.1, its `torchao_quantizer` references those removed symbols and
+> also hits a `logger` scoping bug, which makes any third-party plugin that
+> imports diffusers (SeedVR2, WanVideoWrapper, Easy-Use, ...) fail with
+> `IMPORT FAILED` on XPU. **This plugin itself does not import diffusers and
+> is unaffected** (it uses the `quantize_.workflows` path, compatible with
+> both 0.17 and 0.18).
+>
+> **Minimal insurance only**: `requirements.txt` declares
+> `diffusers>=0.37.1` (officially fixed in that version) — no pinning, no
+> overwriting of your existing diffusers. Your choice:
+> - Default: torchao installed latest from the XPU index (0.18+ today) with
+>   `diffusers>=0.37.1` — compatible and hassle-free;
+> - Older torchao: `torchao==0.17.0` also works, but keep diffusers >=0.37.1
+>   (0.17 also lacks the old symbols);
+> - Newer versions: fine, but may pull in other dependency updates (e.g.
+>   huggingface-hub) — evaluate at your own discretion.
+>
+> If you see `IMPORT FAILED`, run
+> `pip install -U "diffusers>=0.37.1"` first.
+
 ## Model downloads
 
 Quantized INT4 models:

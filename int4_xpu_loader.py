@@ -31,6 +31,35 @@ _LOAD_T0 = 0.0
 _TAO_ERR_PRINTED = False
 
 
+def _svdq_preconverted_has_zp(svdq):
+    """onednn_int4_gemm_preconverted 是否真正带 per-block zp 参数。
+
+    A 系列 fork / 原仓库 PR 的 4 参版本 (act, packed, scales, zp) 支持
+    tint4 原生；B 系列原仓库的 3 参版本 (act, packed, scales) 不支持 zp，
+    只能走 tint4→wa4 转换路径。仅靠 hasattr 会把 3 参版误判为 tint4
+    原生 → forward 4 参调用崩 TypeError（B580 实测）。
+    """
+    fn = getattr(svdq, "onednn_int4_gemm_preconverted", None)
+    if fn is None:
+        return False
+    try:
+        import inspect
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+        # 可接受位置实参的个数：positional-only + positional-or-keyword，
+        # 去掉有默认值的（可选）。*args 视为不固定 → 保守按有 zp 处理。
+        n_pos = sum(
+            1 for p in params
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            and p.default is p.empty
+        )
+        has_varargs = any(p.kind is p.VAR_POSITIONAL for p in params)
+        return has_varargs or n_pos >= 4
+    except Exception:
+        # 签名探测失败时保守按「无 zp」处理 → 走转换路径（安全）
+        return False
+
+
 def _kernel_caps():
     """omni_xpu_kernel 可用算子检测（kernel 分 A/B 版、更新频繁，加载时探测）。"""
     caps = {"w4a4": False, "s8u4": False, "int4": False, "tint4": False}
@@ -44,11 +73,12 @@ def _kernel_caps():
             hasattr(svdq, "onednn_int4_gemm_preconverted")
             or hasattr(svdq, "onednn_int4_gemm")
         )
-        # tint4 原生：A 系列 fork 有独立 onednn_int4_gemm_torchao；
-        # B 系列（原仓库 PR）是 onednn_int4_gemm_preconverted 带 zp 参数。
+        # tint4 原生：A 系列 fork 有独立 onednn_int4_gemm_torchao（4 参带 zp）；
+        # B 系列需校验 onednn_int4_gemm_preconverted 真的带 zp（≥4 参），
+        # 否则 3 参版（无 zp）误报 tint4 → forward 4 参调用崩溃。
         caps["tint4"] = (
             hasattr(svdq, "onednn_int4_gemm_torchao")
-            or hasattr(svdq, "onednn_int4_gemm_preconverted")
+            or _svdq_preconverted_has_zp(svdq)
         )
     except Exception:
         pass
@@ -1034,15 +1064,23 @@ class INT4XPULinear(nn.Module):
                 # TINT4 原生：per-block zp 在 oneDNN 内应用，w=(q-zp)*scale
                 # A 系列 fork：独立 onednn_int4_gemm_torchao / torchao 名；
                 # B 系列（原仓库 PR）：onednn_int4_gemm_preconverted 的 zp 参数。
+                # 注意：此分支只在 caps["tint4"]=True（真带 zp）时进入；
+                # 3 参版 preconverted 由加载期转换路径处理，不会到这里。
                 if hasattr(svdq, "onednn_int4_gemm_torchao"):
                     o = svdq.onednn_int4_gemm_torchao(
                         x2, self._w_packed, self._zp, self._w_s)
-                elif hasattr(svdq, "onednn_int4_gemm_torchao"):
-                    o = svdq.onednn_int4_gemm_torchao(
-                        x2, self._w_packed, self._zp, self._w_s)
-                else:
+                elif _svdq_preconverted_has_zp(svdq):
+                    # B 系列 4 参版（原仓库 PR）：(act, packed, scales, zp)
                     o = svdq.onednn_int4_gemm_preconverted(
                         x2, self._w_packed, self._w_s, self._zp)
+                else:
+                    # 防御兜底：cap 探测与实际签名不一致时（如 kernel 热更新），
+                    # 不再裸传 4 参，明确报错避免 TypeError。
+                    raise RuntimeError(
+                        "[int4] tint4 原生路径进入但 onednn_int4_gemm_preconverted "
+                        "不带 per-block zp 参数（3 参版）——请用转换路径 "
+                        "(OMNIXPU_INT4_TINT4_NATIVE=0) 或更新 kernel"
+                    )
             else:
                 o = svdq.onednn_int4_gemm_preconverted(x2, self._w_packed, self._w_s)
         else:
@@ -1526,12 +1564,17 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
     _n_cast = 0
     for _m in model.modules():
         if isinstance(_m, nn.Linear) and not isinstance(_m, INT4XPULinear):
-            if _m.weight is not None and _m.weight.dtype != act_dtype:
-                _m.weight.data = _m.weight.data.to(act_dtype)
+            if _m.weight is not None:
+                if _m.weight.dtype != act_dtype:
+                    _m.weight.data = _m.weight.data.to(act_dtype)
+                    _n_cast += 1
                 # 同步归档 dtype：ComfyUI vbar cast 路径按 weight._model_dtype
                 # 生成 geometry，若保留模型原始 fp32 归档 dtype，会与实权重
                 # (fp16) 产生 2× 缓冲错位 → "Buffer too small: needs 62914560,
                 # has 31469568"（txtmlp 等未量化层 + 风情万种 LoRA 实测）。
+                # 注意必须无条件同步：fp16 模型里权重已等于 act_dtype、不走
+                # cast 分支，但 weight_comfyn/_model_dtype 仍是 fp32（archivens
+                # 归档），一旦该层走 vbar fault 路径就会触发 needs_cast。
                 try:
                     if hasattr(_m.weight, "_model_dtype"):
                         _m.weight._model_dtype = act_dtype
@@ -1539,7 +1582,6 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
                         _m.weight_comfyn = act_dtype
                 except Exception:
                     pass
-                _n_cast += 1
             if _m.bias is not None and _m.bias.dtype != act_dtype:
                 _m.bias.data = _m.bias.data.to(act_dtype)
     if _n_cast:
@@ -1560,6 +1602,7 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
 
     index = _build_wa4_lora_index(model)
     object.__setattr__(model, '_wa4_lora_index', index)
+    object.__setattr__(model, '_wa4_act_dtype', act_dtype)
     object.__setattr__(model, '_wa4_quarot_enabled', use_quarot)
     object.__setattr__(model, '_wa4_quarot_gs', qgs)
     log.info("[int4] LoRA index: %d entries (QuaRot=%s)", len(index), use_quarot)

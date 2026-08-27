@@ -14,6 +14,11 @@ import os
 import subprocess
 
 
+# 最低保险：不强制 torchao 版本（用户可自行取舍 0.17 / 0.18+）。
+# torchao 0.18+ 移除 torchao.dtypes 旧符号 → diffusers<0.37.1 的
+# torchao_quantizer 会崩（SeedVR2 等 import diffusers 的第三方插件
+# IMPORT FAILED），该风险由 requirements.txt 的 diffusers>=0.37.1 兜底，
+# 详见 README「torchao 依赖与 diffusers 联动说明」。
 MIN_TAO = (0, 17, 0)
 PIP_TIMEOUT = 300
 

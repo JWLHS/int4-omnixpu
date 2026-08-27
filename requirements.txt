@@ -1,0 +1,5 @@
+# torchao 由 int4_xpu_install.py 固定安装 0.17.0（XPU 稳定版）。若用户自行
+# 升级到 torchao 0.18+（其移除了 torchao.dtypes 旧符号），则 diffusers 必须
+# >=0.37.1，否则 torchao_quantizer 崩溃导致 SeedVR2 / WanVideoWrapper 等
+# import diffusers 的第三方插件 IMPORT FAILED。本插件自身不 import diffusers。
+diffusers>=0.37.1
