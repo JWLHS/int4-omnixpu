@@ -8,8 +8,8 @@ format and the asymmetric INT4 format quantized on the torchao backend
 `omni_xpu_kernel`.
 
 > The current release is built around the **w4a16 backend** (INT4 weights +
-> 16-bit activations). The a8/a4 backends are still under development and are
-> hidden from the UI.
+> 16-bit activations, stable). **w4a8 / w4a4 are now exposed** (experimental,
+> off by default) — see "Enabling w4a8 / w4a4".
 
 ## What this plugin does (and doesn't)
 
@@ -199,8 +199,8 @@ format at w4a16:
 | Qwen-AIO | ~1.5 | ~2.1 | tint4 conversion/native path difference |
 | Z-Image Turbo | ~1.05 | ~1.06 | fastest |
 
-(Full 20-model cold/warm comparison and per-step details are in the
-`docs/` folder of this repo.)
+(Full 20-model cold/warm comparison and per-step details are in the local
+`docs/` test records; not shipped with the repo.)
 
 ## Environment variables
 
@@ -231,7 +231,9 @@ then **our local test settings (reference only)** and why:
 
 ## Known limitations
 
-- a8 / a4 backends are under development; the current release is w4a16.
+- a8 / a4 are experimental (default w4a16): a8 needs `onednn_s8u4_gemm`,
+  a4 needs ESIMD s8u4, missing ops fall back automatically; on B series,
+  building the kernel from PR #629 gives w4a8, w4a4 stays A-series only.
 - WAN / LTX2 video models are deferred (INT4 precision loss is too high).
 - Without a kernel, fallback paths (python/torchao) are slow — availability
   fallback only.
