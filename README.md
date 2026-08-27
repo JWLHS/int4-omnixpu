@@ -103,15 +103,45 @@ torchao；无 kernel 时自动回退到 torchao 路径，功能完整、速度�
 2. 把本插件放进 `ComfyUI/custom_nodes/`。
 3. 模型放入 `models/diffusion_models/`。
 4. 工作流中用 **int4XPUModelLoader** 节点：`unet_name` 选模型文件，
-   `backend` 选 **w4a16**。
+   `backend` 默认 **w4a16**（稳定推荐）；想尝试显存更省的
+   **w4a8 / w4a4** 可手动切换（实验性，见下方「后端开启说明」）。
 
 节点一览：
 
-- **int4XPUModelLoader**：wa4 / tint4 统一加载（当前正式版 backend 仅 w4a16；
-  a8/a4 隐藏待开发）。
+- **int4XPUModelLoader**：wa4 / tint4 统一加载（backend 默认 w4a16；
+  w4a8 / w4a4 可选，实验性）。
 - **int4XPUModelQuantizer**：把 fp16/bf16/fp8/int8 模型量化为 wa4 格式。
 - **INT4XPU LoRA Loader / Stack**：LoRA 注入（GPU 侧缓存，避免逐层 H2D 造成
   CPU 高占用）。
+
+## 后端开启说明（w4a8 / w4a4）
+
+`int4XPUModelLoader` 的 `backend` 下拉已开放 **w4a8** 与 **w4a4**（默认
+仍为 w4a16）。它们依赖 kernel 提供对应算子，**没有算子时插件自动逐级
+回退**（w4a4 → w4a8 → w4a16），不会报错：
+
+| 后端 | 需要 kernel 算子 | 说明 |
+|---|---|---|
+| **w4a16**（默认） | `onednn_int4_gemm_preconverted` / `onednn_int4_gemm` | 稳定推荐 |
+| **w4a8** | `onednn_s8u4_gemm` | 显存更省；A 系列 kernel 已合入，B 系列见下方 PR 指引 |
+| **w4a4** | ESIMD s8u4（`w4a4_gemm_fused` 等） | 仅 A 系列 kernel 提供，B 系列无此算子 |
+
+**各系列 kernel 获取**：
+
+- **A 系列（A770/DG2）**：直接编译安装
+  [Blackwood416/omni-xpu-kernel](https://github.com/Blackwood416/omni-xpu-kernel)
+  最新版即可（tint4 与 w4a8 均已合入主分支）。
+- **B 系列（BMG/PTL-H）**：原仓库 [intel/llm-scaler](https://github.com/intel/llm-scaler)
+  **尚未合并** per-block zp INT4 与 a8 算子，需要从我们提交的 PR 分支
+  自行编译 kernel：
+  - PR #629（tint4 per-block zp GEMM + 插件适配）：
+    <https://github.com/intel/llm-scaler/pull/629> —— 拉取该 PR 的
+    `codex/int4-torchao` 分支，编译 `omni/omni_xpu_kernel` 后安装；
+  - a8（`onednn_s8u4_gemm`）在原仓库暂无对应 PR，B 系列暂不可用
+    （可用 w4a16 或等后续提交）。
+
+> 提示：B 系列想用 tint4 原生加速，按 PR #629 分支编译 kernel 即可；
+> 不想编译就用默认 w4a16 + 转换路径（功能完整、速度稍慢）。
 
 ## 后端回退（安全兜底）
 

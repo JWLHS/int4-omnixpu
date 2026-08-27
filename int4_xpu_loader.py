@@ -1618,13 +1618,11 @@ class int4XPUModelLoader:
     def INPUT_TYPES(s):
         return {"required": {
             "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-            # w4a4 暂屏蔽：层间 INT4 激活传递未实现（见 INT4XPULinear.forward）。
-            # w4a8-s8(88) 已从 UI 移除：实测比 84 慢且权重内存 x2，无保留价值；
-            # 源码路径保留（backend="w4a8-s8" 仍可用）供开发对比。
-            # w4a8 随 kernel PR 开放；kernel 缺 onednn_s8u4_gemm 时
-            # _resolve_backend 自动逐级回退 w4a16。a4 预留，层间 INT4
-            # 传递实现后开放。
-            "backend": (["w4a16", "w4a8"], {"default": "w4a16"}),
+            # 后端选项：默认 w4a16。w4a8 / w4a4 为实验性，需要对应 kernel
+            # 算子（缺算子时 _resolve_backend 自动逐级回退 w4a8 → w4a16）：
+            #   w4a8  → onednn_s8u4_gemm（A 系列已合入；B 系列见 README PR 指引）
+            #   w4a4  → hand-written ESIMD s8u4（仅 A 系列 kernel，B 系列无）
+            "backend": (["w4a16", "w4a8", "w4a4"], {"default": "w4a16"}),
         }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_model"

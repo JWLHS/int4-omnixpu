@@ -120,16 +120,49 @@ and use the relative path when loading.
 2. Put this plugin in `ComfyUI/custom_nodes/`.
 3. Put models in `models/diffusion_models/`.
 4. In your workflow use the **int4XPUModelLoader** node: select the model
-   file in `unet_name` and choose **w4a16** for `backend`.
+   file in `unet_name`; `backend` defaults to **w4a16** (stable). You may
+   switch to **w4a8 / w4a4** to try lower VRAM (experimental — see
+   "Enabling w4a8 / w4a4" below).
 
 Nodes:
 
-- **int4XPUModelLoader**: unified loader for wa4 / tint4 (current release
-  exposes only w4a16; a8/a4 hidden pending development).
+- **int4XPUModelLoader**: unified loader for wa4 / tint4 (backend defaults
+  to w4a16; w4a8 / w4a4 optional, experimental).
 - **int4XPUModelQuantizer**: quantize fp16/bf16/fp8/int8 models to the wa4
   format.
 - **INT4XPU LoRA Loader / Stack**: LoRA injection (GPU-side cache, avoiding
   per-layer H2D CPU spikes).
+
+## Enabling w4a8 / w4a4
+
+The `backend` dropdown of `int4XPUModelLoader` now exposes **w4a8** and
+**w4a4** (default stays w4a16). They require the corresponding kernel ops;
+**if an op is missing the plugin falls back automatically** (w4a4 → w4a8 →
+w4a16), never an error:
+
+| Backend | Kernel op required | Notes |
+|---|---|---|
+| **w4a16** (default) | `onednn_int4_gemm_preconverted` / `onednn_int4_gemm` | Stable, recommended |
+| **w4a8** | `onednn_s8u4_gemm` | Lower VRAM; merged in A-series kernel, B-series see PR below |
+| **w4a4** | ESIMD s8u4 (`w4a4_gemm_fused` etc.) | A-series kernel only; not available on B-series |
+
+**Kernel builds per series**:
+
+- **A series (A770/DG2)**: build the latest
+  [Blackwood416/omni-xpu-kernel](https://github.com/Blackwood416/omni-xpu-kernel)
+  (tint4 and w4a8 are already merged into its main branch).
+- **B series (BMG/PTL-H)**: the upstream
+  [intel/llm-scaler](https://github.com/intel/llm-scaler) has **not merged**
+  the per-block-zp INT4 or a8 ops yet. Build the kernel from our PR branch:
+  - PR #629 (tint4 per-block zp GEMM + plugin adapter):
+    <https://github.com/intel/llm-scaler/pull/629> — fetch its
+    `codex/int4-torchao` branch, build `omni/omni_xpu_kernel`, install;
+  - a8 (`onednn_s8u4_gemm`) has no upstream PR yet, so it is unavailable on
+    B series for now (use w4a16 or wait for a later submission).
+
+> Tip: for native tint4 acceleration on B series, build the kernel from the
+> PR #629 branch; otherwise stick with default w4a16 + the conversion path
+> (full functionality, slightly slower).
 
 ## Backend fallback (safe)
 
