@@ -134,11 +134,11 @@ torchao；无 kernel 时自动回退到 torchao 路径，功能完整、速度�
 - **B 系列（BMG/PTL-H）**：原仓库 [intel/llm-scaler](https://github.com/intel/llm-scaler)
   **尚未合并** per-block zp INT4 与 a8 算子，需要从我们提交的 PR 分支
   自行编译 kernel：
-  - PR #629（tint4 per-block zp GEMM + 插件适配）：
+  - PR #629（tint4 per-block zp GEMM + w4a8 s8u4 GEMM + 插件适配）：
     <https://github.com/intel/llm-scaler/pull/629> —— 拉取该 PR 的
     `codex/int4-torchao` 分支，编译 `omni/omni_xpu_kernel` 后安装；
-  - a8（`onednn_s8u4_gemm`）在原仓库暂无对应 PR，B 系列暂不可用
-    （可用 w4a16 或等后续提交）。
+    该 PR 同时包含 a8（`onednn_s8u4_gemm`）与 tint4（per-block zp）
+    两个算子，编译后 w4a8 可用；w4a4（ESIMD）仍仅 A 系列 kernel 提供。
 
 > 提示：B 系列想用 tint4 原生加速，按 PR #629 分支编译 kernel 即可；
 > 不想编译就用默认 w4a16 + 转换路径（功能完整、速度稍慢）。

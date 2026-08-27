@@ -154,11 +154,11 @@ w4a16), never an error:
 - **B series (BMG/PTL-H)**: the upstream
   [intel/llm-scaler](https://github.com/intel/llm-scaler) has **not merged**
   the per-block-zp INT4 or a8 ops yet. Build the kernel from our PR branch:
-  - PR #629 (tint4 per-block zp GEMM + plugin adapter):
+  - PR #629 (tint4 per-block zp GEMM + w4a8 s8u4 GEMM + plugin adapter):
     <https://github.com/intel/llm-scaler/pull/629> — fetch its
     `codex/int4-torchao` branch, build `omni/omni_xpu_kernel`, install;
-  - a8 (`onednn_s8u4_gemm`) has no upstream PR yet, so it is unavailable on
-    B series for now (use w4a16 or wait for a later submission).
+    the PR contains both a8 (`onednn_s8u4_gemm`) and tint4 (per-block zp);
+    after building, w4a8 works on B series (w4a4/ESIMD remains A-series only).
 
 > Tip: for native tint4 acceleration on B series, build the kernel from the
 > PR #629 branch; otherwise stick with default w4a16 + the conversion path
