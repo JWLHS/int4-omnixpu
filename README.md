@@ -124,7 +124,7 @@ torchao；无 kernel 时自动回退到 torchao 路径，功能完整、速度�
 |---|---|---|
 | **w4a16**（默认） | `onednn_int4_gemm_preconverted` / `onednn_int4_gemm` | 稳定推荐 |
 | **w4a8** | `onednn_s8u4_gemm` | 显存更省；A 系列 kernel 已合入，B 系列见下方 PR 指引 |
-| **w4a4** | ESIMD s8u4（`w4a4_gemm_fused` 等） | 仅 A 系列 kernel 提供，B 系列无此算子 |
+| **w4a4** | a4 激活原语（`quantize_act_int4`/`unpack_int4`）已就绪；w4a4 GEMM（ESIMD s8u4）当前版本未绑定 | 选中后自动回退 w4a8 → w4a16，待 kernel 绑定 w4a4 GEMM 后启用 |
 
 **各系列 kernel 获取**：
 

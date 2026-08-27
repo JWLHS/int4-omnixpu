@@ -65,8 +65,10 @@ def _kernel_caps():
     caps = {"w4a4": False, "s8u4": False, "int4": False, "tint4": False}
     try:
         from omni_xpu_kernel import svdq
-        # w4a4 预留：kernel 已有 w4a4_gemm_esimd，但层间 INT4 激活传递未实现，
-        # 达成前保持 False，加载时自动逐级回退 w4a8 → w4a16。
+        # w4a4 预留：当前 kernel（0.2.0b1）只暴露 a4 激活量化原语
+        # （quantize_act_int4 / unpack_int4），w4a4 GEMM（s8u4_gemm_esimd /
+        # w4a4_gemm_fused）仅有 C++ 源码、未绑定到 Python；层间 INT4 激活
+        # 传递也未实现。达成前保持 False，加载时自动逐级回退 w4a8 → w4a16。
         caps["w4a4"] = False
         caps["s8u4"] = hasattr(svdq, "onednn_s8u4_gemm")
         caps["int4"] = (

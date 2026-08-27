@@ -144,7 +144,7 @@ w4a16), never an error:
 |---|---|---|
 | **w4a16** (default) | `onednn_int4_gemm_preconverted` / `onednn_int4_gemm` | Stable, recommended |
 | **w4a8** | `onednn_s8u4_gemm` | Lower VRAM; merged in A-series kernel, B-series see PR below |
-| **w4a4** | ESIMD s8u4 (`w4a4_gemm_fused` etc.) | A-series kernel only; not available on B-series |
+| **w4a4** | a4 activation primitives (`quantize_act_int4`/`unpack_int4`) ready; w4a4 GEMM (ESIMD s8u4) not bound in the current build | Auto-falls back to w4a8 → w4a16; enabled once the kernel binds a w4a4 GEMM |
 
 **Kernel builds per series**:
 
