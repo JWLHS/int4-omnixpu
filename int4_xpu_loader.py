@@ -1482,43 +1482,6 @@ def _patch_omni_norm(model, cfg_type):
     except Exception:
         log.warning("[int4] omni norm patch failed, falling back to PyTorch native")
         pass
-
-
-def _align_unquantized_dtype(model, act_dtype):
-    """把未量化 Linear 层 weight/bias 对齐到 act_dtype，并同步归档 dtype。
-
-    AIMDO 启用时模型走 disable_weight_init 懒加载：get_model 阶段（即
-    _inject_wa4_pre_load 内）未量化层 weight 还是 None，旧的就地 cast
-    循环看不到它们；权重随后按文件原 dtype（krea2 的 txtmlp 是 F32）物化，
-    而 weight_comfy_model_dtype 是构造时传入的 act_dtype（fp16）→
-    vbar 按 fp16 分配，但 bake 换权后新权重没有 _model_dtype、geometry
-    按实际 fp32 算 → 62,914,560 塞进 31,469,568 的缓冲 → Buffer too small。
-    这里在模型完整加载后补跑一遍，让权重 / _model_dtype /
-    weight_comfy_model_dtype 三者一致（与无 AIMDO 时就地 cast 行为一致）。
-    """
-    _n = 0
-    for _m in model.modules():
-        if isinstance(_m, nn.Linear) and not isinstance(_m, INT4XPULinear):
-            if _m.weight is not None:
-                if _m.weight.dtype != act_dtype:
-                    _m.weight.data = _m.weight.data.to(act_dtype)
-                    _n += 1
-                try:
-                    object.__setattr__(_m.weight, "_model_dtype", act_dtype)
-                    if hasattr(_m, "weight_comfy_model_dtype"):
-                        _m.weight_comfy_model_dtype = act_dtype
-                    if hasattr(_m, "weight_comfyn"):
-                        _m.weight_comfyn = act_dtype
-                except Exception:
-                    pass
-            if _m.bias is not None and _m.bias.dtype != act_dtype:
-                _m.bias.data = _m.bias.data.to(act_dtype)
-    if _n:
-        log.info("[int4] cast %d unquantized Linear to %s (post-load AIMDO dtype align)",
-                 _n, act_dtype)
-    return _n
-
-
 def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
                          use_quarot=False, hadamard_H=None, qgs=128,
                          act_dtype=torch.float16, backend="w4a16",
@@ -1844,17 +1807,6 @@ class int4XPUModelLoader:
             cfg.get_model = _o2; md.model_config_from_unet = _o1
         _t = _tphase("model built", _t)
         _ram_trace("model built")
-
-        # ── AIMDO 懒加载 dtype 对齐（补跑）──
-        # 见 _align_unquantized_dtype：AIMDO 下 get_model 阶段权重未物化，
-        # _inject_wa4_pre_load 内的 cast 循环看不到 txtmlp 等 F32 未量化层，
-        # 必须等完整加载后再对齐一次，否则 bake 后 geometry(f32) 与
-        # vbar(f16) 错位 → Buffer too small。
-        try:
-            _align_unquantized_dtype(model.model.diffusion_model, act_dtype)
-        except Exception as _e:
-            log.warning("[int4] post-load dtype align failed: %r", _e)
-
         # ── AIMDO 适配（让路）──
         try:
             from .int4_xpu_aimdo import patch_aimdo_xpu
