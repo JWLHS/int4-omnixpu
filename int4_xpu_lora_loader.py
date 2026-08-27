@@ -57,51 +57,100 @@ def _make_bake_pre_hook(module: nn.Module):
         cpu = torch.device("cpu")
         applied = []
         try:
-            # v3.5：克隆新权重（AIMDO 分配），全部 delta 在克隆张量上操作，最后整体换权重
-            w_new = module.weight.detach().clone()
-            for entry in pending:
-                # ── lokr "delta" entry: ("delta", delta_matrix, mult, sl, se) ──
-                if len(entry) >= 3 and isinstance(entry[0], str) and entry[0] == "delta":
-                    _, delta_cpu, mult = entry[:3]
-                    sl = entry[3] if len(entry) > 3 else None
-                    se = entry[4] if len(entry) > 4 else None
-                    delta_gpu = delta_cpu.to(device=w_dev, dtype=w_dtype).mul_(mult)
-                # ── standard entry: (A_cpu, B_cpu, mult, sl, se) ──
-                else:
-                    A_cpu, B_cpu, mult = entry[:3]
-                    sl = entry[3] if len(entry) > 3 else None
-                    se = entry[4] if len(entry) > 4 else None
-                    if sl is not None and se is not None and B_cpu.shape[0] != (se - sl):
-                        B_cpu = B_cpu[sl:se].contiguous()
-                    A_gpu = A_cpu.to(device=w_dev, dtype=w_dtype)
-                    B_gpu = B_cpu.to(device=w_dev, dtype=w_dtype)
-                    delta_gpu = (B_gpu @ A_gpu).mul_(mult)
-
-                # ── Apply delta（v3.5：克隆张量上段加，不原地写现有权重页）──
-                if sl is not None and se is not None:
-                    target_rows = se - sl
-                else:
-                    target_rows = w_new.shape[0]
-
-                if delta_gpu.shape[0] == target_rows:
-                    if sl is not None and se is not None:
-                        w_new[sl:se] += delta_gpu
+            from .int4_xpu_aimdo import aimdo_active as _aimdo_active
+            _aimdo_on = _aimdo_active()
+        except Exception:
+            _aimdo_on = False
+        try:
+            if _aimdo_on:
+                # ── AIMDO 路径：CPU 合成 delta + dtype 对齐 ──
+                # AIMDO 生效时 GPU 小 GEMM（B@A）慢 100-1000 倍（实测 2-6s/层），
+                # 且懒加载未量化层可能按文件原 dtype（F32）物化导致 vbar 缓冲错位
+                # （Buffer too small）。这里在 CPU 合成 delta（32 层 <1s），换权时
+                # 强制对齐到 weight_comfy_model_dtype（act_dtype），一并规避两者。
+                target_dtype = getattr(module, "weight_comfy_model_dtype", None) or w_dtype
+                w_new = module.weight.detach().clone().to(target_dtype)
+                for entry in pending:
+                    if len(entry) >= 3 and isinstance(entry[0], str) and entry[0] == "delta":
+                        _, delta_cpu, mult = entry[:3]
+                        sl = entry[3] if len(entry) > 3 else None
+                        se = entry[4] if len(entry) > 4 else None
+                        delta_c = delta_cpu.float().mul_(mult)
                     else:
-                        w_new += delta_gpu
-                elif delta_gpu.shape[0] % target_rows == 0:
-                    # 融合层：delta 是 N 个 head 拼接，逐段加进克隆张量
-                    n = delta_gpu.shape[0] // target_rows
-                    base_sl = sl if sl is not None else 0
-                    for i in range(n):
-                        seg = slice(base_sl + i * target_rows,
-                                    base_sl + (i + 1) * target_rows)
-                        w_new[seg] += delta_gpu[i * target_rows:(i + 1) * target_rows]
-                else:
-                    log.warning(f"[int4 LoRA] shape mismatch delta={tuple(delta_gpu.shape)} "
-                                f"target={tuple(module.weight.shape)} — skip")
-                    continue
-                applied.append((delta_gpu.to(device=cpu, dtype=torch.float16).clone(), sl, se))
-            module.weight = nn.Parameter(w_new)   # 换新权重（AIMDO 分配），原页由 AIMDO 回收
+                        A_cpu, B_cpu, mult = entry[:3]
+                        sl = entry[3] if len(entry) > 3 else None
+                        se = entry[4] if len(entry) > 4 else None
+                        if sl is not None and se is not None and B_cpu.shape[0] != (se - sl):
+                            B_cpu = B_cpu[sl:se].contiguous()
+                        delta_c = (B_cpu.float() @ A_cpu.float()).mul_(mult)
+                    if sl is not None and se is not None:
+                        target_rows = se - sl
+                    else:
+                        target_rows = w_new.shape[0]
+                    delta_t = delta_c.to(target_dtype)
+                    if delta_t.shape[0] == target_rows:
+                        if sl is not None and se is not None:
+                            w_new[sl:se] += delta_t
+                        else:
+                            w_new += delta_t
+                    elif delta_t.shape[0] % target_rows == 0:
+                        n = delta_t.shape[0] // target_rows
+                        base_sl = sl if sl is not None else 0
+                        for i in range(n):
+                            seg = slice(base_sl + i * target_rows,
+                                        base_sl + (i + 1) * target_rows)
+                            w_new[seg] += delta_t[i * target_rows:(i + 1) * target_rows]
+                    else:
+                        log.warning(f"[int4 LoRA] shape mismatch delta={tuple(delta_t.shape)} "
+                                    f"target={tuple(module.weight.shape)} — skip")
+                        continue
+                    applied.append((delta_c.to(torch.float16).clone(), sl, se))
+                module.weight = nn.Parameter(w_new)
+                object.__setattr__(module.weight, "_model_dtype", target_dtype)
+                if hasattr(module, "weight_comfy_model_dtype"):
+                    module.weight_comfy_model_dtype = target_dtype
+                if hasattr(module, "weight_comfyn"):
+                    module.weight_comfyn = target_dtype
+            else:
+                # ── 原路径（无 AIMDO）：GPU 克隆 + GEMM ──
+                w_new = module.weight.detach().clone()
+                for entry in pending:
+                    if len(entry) >= 3 and isinstance(entry[0], str) and entry[0] == "delta":
+                        _, delta_cpu, mult = entry[:3]
+                        sl = entry[3] if len(entry) > 3 else None
+                        se = entry[4] if len(entry) > 4 else None
+                        delta_gpu = delta_cpu.to(device=w_dev, dtype=w_dtype).mul_(mult)
+                    else:
+                        A_cpu, B_cpu, mult = entry[:3]
+                        sl = entry[3] if len(entry) > 3 else None
+                        se = entry[4] if len(entry) > 4 else None
+                        if sl is not None and se is not None and B_cpu.shape[0] != (se - sl):
+                            B_cpu = B_cpu[sl:se].contiguous()
+                        A_gpu = A_cpu.to(device=w_dev, dtype=w_dtype)
+                        B_gpu = B_cpu.to(device=w_dev, dtype=w_dtype)
+                        delta_gpu = (B_gpu @ A_gpu).mul_(mult)
+                    if sl is not None and se is not None:
+                        target_rows = se - sl
+                    else:
+                        target_rows = w_new.shape[0]
+                    if delta_gpu.shape[0] == target_rows:
+                        if sl is not None and se is not None:
+                            w_new[sl:se] += delta_gpu
+                        else:
+                            w_new += delta_gpu
+                    elif delta_gpu.shape[0] % target_rows == 0:
+                        n = delta_gpu.shape[0] // target_rows
+                        base_sl = sl if sl is not None else 0
+                        for i in range(n):
+                            seg = slice(base_sl + i * target_rows,
+                                        base_sl + (i + 1) * target_rows)
+                            w_new[seg] += delta_gpu[i * target_rows:(i + 1) * target_rows]
+                    else:
+                        log.warning(f"[int4 LoRA] shape mismatch delta={tuple(delta_gpu.shape)} "
+                                    f"target={tuple(module.weight.shape)} — skip")
+                        continue
+                    applied.append((delta_gpu.to(device=cpu, dtype=torch.float16).clone(), sl, se))
+                module.weight = nn.Parameter(w_new)
         except Exception as e:
             log.warning("[int4 LoRA] bake pre-hook failed: %s", e)
         bs.pop('_pending', None)
@@ -338,4 +387,3 @@ class INT4XPULoRALoader:
 
 NODE_CLASS_MAPPINGS = {"INT4XPULoRALoader": INT4XPULoRALoader}
 NODE_DISPLAY_NAME_MAPPINGS = {"INT4XPULoRALoader": "INT4XPU LoRA Loader"}
-
