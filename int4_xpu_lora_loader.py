@@ -46,117 +46,62 @@ def _resolve_qkv_slices(index, norm):
 
 # ── Pre-hook for nn.Linear bake ──────────────────────────────
 
-def _reset_bake_vbar(module):
-    """Bake 替换权重后，清掉 ComfyUI 缓存的 vbar prefetch/签名，强制下次
-    forward 用新权重重建 cast 路径。所有 bake 层都必须执行（权重都变了）。
-
-    注意：_v_signature 只能置 None，不能 delattr ——
-    comfy.ops.cast_modules_with_vbar 直接访问 s._v_signature，
-    属性缺失会抛 AttributeError；置 None 后 vbar_signature_compare 返回
-    False，强制走重建路径。
-    """
-    for attr in ("_prefetch", "_v_weight", "_v_bias"):
-        try:
-            if hasattr(module, attr):
-                delattr(module, attr)
-        except Exception:
-            pass
-    try:
-        module._v_signature = None
-    except Exception:
-        pass
-
-
-def _sync_baked_dtype(module, dtype):
-    """仅对「实际权重 dtype ≠ 模型 act_dtype」的层同步归档 dtype（txtmlp 类
-    fp32 未量化层），否则 ComfyUI geometry 按 fp32 算而 AIMDO vbar 缓冲按
-    fp16 分配 → 2x 错位 → Buffer too small。正常 fp16 层不调用本函数，
-    其他 lora 完全不受影响。
-    """
-    try:
-        w = module.weight
-        if w is not None:
-            # 无条件设置：bake 换上的新权重是 clone 出来的，没有 _model_dtype，
-            # hasattr 判断会漏掉 → geometry 退回 t.dtype(fp32)
-            object.__setattr__(w, "_model_dtype", dtype)
-            if hasattr(module, "weight_comfyn"):
-                module.weight_comfyn = dtype
-            if hasattr(module, "weight_comfy_model_dtype"):
-                module.weight_comfy_model_dtype = dtype
-            if hasattr(module, "bias_comfy_model_dtype"):
-                module.bias_comfy_model_dtype = dtype
-    except Exception:
-        log.warning("[int4 LoRA] _sync_baked_dtype error", exc_info=True)
-
-
-def _apply_bake_entry(w_new, entry, w_dtype):
-    """Apply one bake entry onto the cloned weight; returns
-    (delta_cpu_fp16, sl, se) for rollback, or None on shape mismatch."""
-    if len(entry) >= 3 and isinstance(entry[0], str) and entry[0] == "delta":
-        _, delta_cpu, mult = entry[:3]
-        sl = entry[3] if len(entry) > 3 else None
-        se = entry[4] if len(entry) > 4 else None
-        delta_gpu = delta_cpu.to(device=w_new.device, dtype=w_dtype).mul_(mult)
-    else:
-        A_cpu, B_cpu, mult = entry[:3]
-        sl = entry[3] if len(entry) > 3 else None
-        se = entry[4] if len(entry) > 4 else None
-        if sl is not None and se is not None and B_cpu.shape[0] != (se - sl):
-            B_cpu = B_cpu[sl:se].contiguous()
-        A_gpu = A_cpu.to(device=w_new.device, dtype=w_dtype)
-        B_gpu = B_cpu.to(device=w_new.device, dtype=w_dtype)
-        delta_gpu = (B_gpu @ A_gpu).mul_(mult)
-
-    target_rows = (se - sl) if (sl is not None and se is not None) else w_new.shape[0]
-    if delta_gpu.shape[0] == target_rows:
-        if sl is not None and se is not None:
-            w_new[sl:se] += delta_gpu
-        else:
-            w_new += delta_gpu
-    elif delta_gpu.shape[0] % target_rows == 0:
-        n = delta_gpu.shape[0] // target_rows
-        base_sl = sl if sl is not None else 0
-        for i in range(n):
-            seg = slice(base_sl + i * target_rows, base_sl + (i + 1) * target_rows)
-            w_new[seg] += delta_gpu[i * target_rows:(i + 1) * target_rows]
-    else:
-        log.warning(f"[int4 LoRA] shape mismatch delta={tuple(delta_gpu.shape)} "
-                    f"target={tuple(w_new.shape)} — skip")
-        return None
-    return (delta_gpu.to(device=torch.device("cpu"), dtype=torch.float16).clone(), sl, se)
-
-
-def _make_bake_pre_hook(module: nn.Module, act_dtype):
+def _make_bake_pre_hook(module: nn.Module):
     def _pre_hook(_mod, _inputs):
         bs = getattr(module, '_wa4_bake_state', None)
         if bs is None: return
         pending = bs.get('_pending')
         if not pending: return
-        # 仅当该层实际权重 dtype 与模型 act_dtype 不一致（典型：txtmlp 类
-        # fp32 未量化层）才走 dtype 对齐；fp16 层与模型一致 → 完全跳过，
-        # 不影响其他 lora / 其他层。
-        # 兜底：act_dtype 缺失时按权重自身 dtype 处理（mismatch=False，
-        # 走原 v3.5 行为，不做任何 dtype 转换）。
-        target = act_dtype if act_dtype is not None else module.weight.dtype
-        mismatch = module.weight.dtype != target
+        w_dev = module.weight.device
         w_dtype = module.weight.dtype
+        cpu = torch.device("cpu")
         applied = []
         try:
             # v3.5：克隆新权重（AIMDO 分配），全部 delta 在克隆张量上操作，最后整体换权重
             w_new = module.weight.detach().clone()
             for entry in pending:
-                r = _apply_bake_entry(w_new, entry, w_dtype)
-                if r is not None:
-                    applied.append(r)
-            if mismatch:
-                # fp32 归档层 → bake 数学用原 dtype（fp32）算完，最后对齐
-                # 模型 act_dtype，避免 AIMDO vbar(fp16) 与 ComfyUI
-                # geometry(fp32) 2x 错位（Buffer too small）
-                w_new = w_new.to(target)
+                # ── lokr "delta" entry: ("delta", delta_matrix, mult, sl, se) ──
+                if len(entry) >= 3 and isinstance(entry[0], str) and entry[0] == "delta":
+                    _, delta_cpu, mult = entry[:3]
+                    sl = entry[3] if len(entry) > 3 else None
+                    se = entry[4] if len(entry) > 4 else None
+                    delta_gpu = delta_cpu.to(device=w_dev, dtype=w_dtype).mul_(mult)
+                # ── standard entry: (A_cpu, B_cpu, mult, sl, se) ──
+                else:
+                    A_cpu, B_cpu, mult = entry[:3]
+                    sl = entry[3] if len(entry) > 3 else None
+                    se = entry[4] if len(entry) > 4 else None
+                    if sl is not None and se is not None and B_cpu.shape[0] != (se - sl):
+                        B_cpu = B_cpu[sl:se].contiguous()
+                    A_gpu = A_cpu.to(device=w_dev, dtype=w_dtype)
+                    B_gpu = B_cpu.to(device=w_dev, dtype=w_dtype)
+                    delta_gpu = (B_gpu @ A_gpu).mul_(mult)
+
+                # ── Apply delta（v3.5：克隆张量上段加，不原地写现有权重页）──
+                if sl is not None and se is not None:
+                    target_rows = se - sl
+                else:
+                    target_rows = w_new.shape[0]
+
+                if delta_gpu.shape[0] == target_rows:
+                    if sl is not None and se is not None:
+                        w_new[sl:se] += delta_gpu
+                    else:
+                        w_new += delta_gpu
+                elif delta_gpu.shape[0] % target_rows == 0:
+                    # 融合层：delta 是 N 个 head 拼接，逐段加进克隆张量
+                    n = delta_gpu.shape[0] // target_rows
+                    base_sl = sl if sl is not None else 0
+                    for i in range(n):
+                        seg = slice(base_sl + i * target_rows,
+                                    base_sl + (i + 1) * target_rows)
+                        w_new[seg] += delta_gpu[i * target_rows:(i + 1) * target_rows]
+                else:
+                    log.warning(f"[int4 LoRA] shape mismatch delta={tuple(delta_gpu.shape)} "
+                                f"target={tuple(module.weight.shape)} — skip")
+                    continue
+                applied.append((delta_gpu.to(device=cpu, dtype=torch.float16).clone(), sl, se))
             module.weight = nn.Parameter(w_new)   # 换新权重（AIMDO 分配），原页由 AIMDO 回收
-            _reset_bake_vbar(module)
-            if mismatch:
-                _sync_baked_dtype(module, target)
         except Exception as e:
             log.warning("[int4 LoRA] bake pre-hook failed: %s", e)
         bs.pop('_pending', None)
@@ -220,7 +165,6 @@ class INT4XPULoRALoader:
         while hasattr(base_model, '_orig_mod'): base_model = base_model._orig_mod
         quarot_enabled = bool(getattr(base_model, '_wa4_quarot_enabled', False))
         group_size = int(getattr(base_model, '_wa4_quarot_gs', 0))
-        act_dtype = getattr(base_model, '_wa4_act_dtype', None)
         index = getattr(base_model, '_wa4_lora_index', None) or {}
         dev = _get_accelerator_device()
         cpu = torch.device("cpu")
@@ -270,11 +214,11 @@ class INT4XPULoRALoader:
                     if lora_type == "lokr":
                         w1 = info.get("lokr_w1"); w2 = info.get("lokr_w2")
                         if w1 is None or w2 is None: continue
-                        self._inject_lokr(module, lora_name, w1, w2, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant, act_dtype=act_dtype)
+                        self._inject_lokr(module, lora_name, w1, w2, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant)
                     else:
                         down = info.get("down"); up = info.get("up")
                         if down is None or up is None: continue
-                        self._inject_standard(module, lora_name, down, up, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant, act_dtype=act_dtype)
+                        self._inject_standard(module, lora_name, down, up, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant)
                     if is_quant: aq += 1
                     else: ab += 1
                     layer_matched = True
@@ -329,7 +273,7 @@ class INT4XPULoRALoader:
         for m in bm.modules():
             self._pop_module_lora(m, lora_name)
 
-    def _inject_standard(self, module, lora_name, down, up, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False, act_dtype=None):
+    def _inject_standard(self, module, lora_name, down, up, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False):
         # █ 原样保留 █
         A = down.to(cpu, torch.float16).clone()
         B = up.to(cpu, torch.float16).clone()
@@ -345,7 +289,7 @@ class INT4XPULoRALoader:
             se = qkv_slice[1] if qkv_slice else None
             pending.append((A, B, mult, sl, se))
             if '_hook_handle' not in bs:
-                hook = module.register_forward_pre_hook(_make_bake_pre_hook(module, act_dtype))
+                hook = module.register_forward_pre_hook(_make_bake_pre_hook(module))
                 bs['_hook_handle'] = hook
         else:
             le = getattr(module, '_wa4_lora_entries', None)
@@ -357,7 +301,7 @@ class INT4XPULoRALoader:
             else:
                 le.setdefault(lora_name, []).append((A, B, mult))
 
-    def _inject_lokr(self, module, lora_name, w1, w2, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False, act_dtype=None):
+    def _inject_lokr(self, module, lora_name, w1, w2, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False):
         # █ 原样保留 █
         w1_c = w1.to(cpu, torch.float16).clone(); w2_c = w2.to(cpu, torch.float16).clone()
         delta = torch.kron(w1_c, w2_c)
@@ -379,7 +323,7 @@ class INT4XPULoRALoader:
             se = qkv_slice[1] if qkv_slice else None
             pending.append(("delta", delta, strength, sl, se))
             if '_hook_handle' not in bs:
-                hook = module.register_forward_pre_hook(_make_bake_pre_hook(module, act_dtype))
+                hook = module.register_forward_pre_hook(_make_bake_pre_hook(module))
                 bs['_hook_handle'] = hook
         else:
             le = getattr(module, '_wa4_lora_entries', None)
