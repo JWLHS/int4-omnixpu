@@ -248,6 +248,14 @@ then **our local test settings (reference only)** and why:
 - Without a kernel, fallback paths (python/torchao) are slow — availability
   fallback only.
 
+## Changelog
+
+- 2026-08-30: Fix VRAM residency after model unload. When ComfyUI detaches a
+  model (manual unload or VRAM pressure), all INT4 layer XPU weight copies are
+  now released and the class-level strong reference is cleared. Previously only
+  QwenImage without AIMDO released on detach; other models stayed resident in
+  VRAM until a same-series model was loaded again.
+
 ## Credits
 
 - [intel/llm-scaler](https://github.com/intel/llm-scaler) (B-series kernel

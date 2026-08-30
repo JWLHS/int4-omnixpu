@@ -216,6 +216,13 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
 - WAN / LTX2 视频模型 int4 精度损失较高，暂缓适配。
 - kernel 缺失时回退路径（python/torchao）慢，仅作可用性兜底。
 
+## 更新记录
+
+- 2026-08-30：修复模型卸载后显存驻留——ComfyUI 卸载（手动释放或显存压力
+  触发）时，释放全部 INT4 层的 XPU 权重副本并清掉类级强引用。此前只有
+  QwenImage 且未启用 AIMDO 时才释放，其余模型卸载后权重一直驻留显存，
+  仅在同系列模型再次加载时才被覆盖清理。
+
 ## 鸣谢
 
 - [intel/llm-scaler](https://github.com/intel/llm-scaler)（B 系列 kernel

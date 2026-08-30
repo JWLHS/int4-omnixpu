@@ -18,8 +18,6 @@ for _name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnu
     if _t is not None: _FP8_TYPES.add(_t)
 
 _OMNI_NORM_SKIP = {"Boogu", "QwenImage", "Wan", "CogVideoX", "ZImage", "Lens", "Lightricks"}
-_DETACH_RELEASE_MODELS = {"QwenImage"}
-
 _WA4_SYNC = os.environ.get("OMNIXPU_INT4_SYNC", "1") != "0"
 _WA4_SYNC_EVERY = int(os.environ.get("OMNIXPU_INT4_SYNC_EVERY", "64"))
 _RAM_TRACE = os.environ.get("OMNIXPU_RAM_TRACE", "0") != "0"
@@ -1875,20 +1873,32 @@ class int4XPUModelLoader:
             except Exception:
                 pass
 
-        # ── detach 包装：QW 释放（保留 CPU 产物）；小模型（Krea2 等）常驻保速度 ──
+        # ── detach 包装：任何模型卸载时都释放 int4 层的 XPU 副本，并清掉
+        # class 级强引用（_prewarm_target）。否则卸载后模型永远不会被 GC，
+        # 打包权重一直驻留显存——只有同系列模型再次加载覆盖引用时才"自行
+        # 清理"（Krea2/F2K/H3 等均复现）。AIMDO 接管时仍不主动 sync/清缓存，
+        # 保持让路；release_xpu 只把各层自己的 XPU 副本挪回 CPU。 ──
         _o_detach = model.detach
         def _wa4_detach(unpatch_all=True):
             try:
-                # AIMDO 接管时由 AIMDO 统一管理（不主动释放/同步/清缓存）；
-                # 未启用 AIMDO 时保留原 detach 释放兜底。
-                if not _aimdo_manages():
-                    if cfg_type in _DETACH_RELEASE_MODELS:
-                        dm = model.model.diffusion_model
-                        while hasattr(dm, '_orig_mod'):
-                            dm = dm._orig_mod
-                        for m in dm.modules():
-                            if isinstance(m, INT4XPULinear):
+                dm = model.model.diffusion_model
+                while hasattr(dm, '_orig_mod'):
+                    dm = dm._orig_mod
+                for m in dm.modules():
+                    try:
+                        if isinstance(m, INT4XPULinear):
+                            if not _aimdo_manages():
                                 m.release_xpu()
+                            else:
+                                object.__setattr__(m, "_wa4_lora_gpu", None)
+                        elif isinstance(m, (Int4LinearPython, Int4LinearTorchao)):
+                            # 回退类无 release_xpu，只清 LoRA GPU 缓存
+                            object.__setattr__(m, "_wa4_lora_gpu", None)
+                    except Exception:
+                        pass
+                INT4XPULinear._prewarm_target = None
+                INT4XPULinear._prewarm_done = False
+                if not _aimdo_manages():
                     torch.xpu.synchronize()
                     torch.xpu.empty_cache()
             except Exception:
