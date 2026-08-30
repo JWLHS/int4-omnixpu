@@ -35,6 +35,12 @@ _EXCLUSIONS = {
 	"flux2": [
 		"img_in", "time_in", "guidance_in", "txt_in", "final_layer",
 		"double_stream_modulation", "single_stream_modulation",
+		# F2K 敏感性诊断（2026-08-30，实测 32 块单次前向+逐层量化误差）：
+		# img_attn.qkv/proj 在所有 double 块中贡献最大（单层误差 0.42-0.77），
+		# 最后一个 double 块（7）与首/尾 single 块（0/1/23）量化误差最高
+		# （单块 0.57-1.32，single.23.linear2 达 1.32）——这些层保持原精度。
+		"img_attn.qkv", "img_attn.proj",
+		"double_blocks.7.", "single_blocks.0.", "single_blocks.1.", "single_blocks.23.",
 	],
 	"z-image": [
 		"cap_embedder", "t_embedder", "x_embedder", "cap_pad_token",

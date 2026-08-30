@@ -250,6 +250,11 @@ then **our local test settings (reference only)** and why:
 
 ## Changelog
 
+- 2026-08-30: F2K (flux-2-klein-9b) quantization quality fix — the flux2
+  quantizer exclusion list now keeps `img_attn.qkv/proj`, the last double
+  block and the first/last single blocks at full precision (located by a
+  per-layer sensitivity diagnostic). Quantized vs original: SSIM 0.96 /
+  PSNR 24.2dB; the systematic filter-like shift is largely gone.
 - 2026-08-30: Fix VRAM residency after model unload. When ComfyUI detaches a
   model (manual unload or VRAM pressure), all INT4 layer XPU weight copies are
   now released and the class-level strong reference is cleared. Previously only
