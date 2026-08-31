@@ -242,8 +242,33 @@ class INT4XPULoRALoader:
         aq, ab, unmatched = 0, 0, 0
         for norm, info in lora_data.items():
             lora_type = info.get("type", "standard")
-            is_qkv = norm.endswith(".attn.qkv") or norm.endswith(".attn1.qkv") or norm.endswith(".attn2.qkv")
-            targets = _resolve_qkv_slices(index, norm) if is_qkv else [(norm, None)]
+            is_qkv = (norm.endswith(".attn.qkv") or norm.endswith(".attn1.qkv")
+                      or norm.endswith(".attn2.qkv")
+                      or norm.endswith(".attn.wq") or norm.endswith(".attn.wk")
+                      or norm.endswith(".attn.wv"))
+            if is_qkv:
+                if norm.endswith(".attn.qkv"):
+                    targets = _resolve_qkv_slices(index, norm)
+                else:
+                    # to_q/to_k/to_v（归一化为 wq/wk/wv）：模型 fused qkv 时
+                    # 取对应段（q:0..hs / k:hs..2hs / v:2hs..3hs），否则全量。
+                    seg = {"wq": 0, "wk": 1, "wv": 2}[norm.rsplit(".", 1)[-1]]
+                    base = norm.rsplit(".attn", 1)[0]
+                    qkv_mods = _resolve_with_alias(index, base + ".attn.qkv")
+                    if qkv_mods:
+                        m = qkv_mods[0]
+                        out_f = (m.out_features if hasattr(m, "out_features")
+                                 else (m.weight.shape[0] if hasattr(m, "weight")
+                                       and m.weight is not None else 0))
+                        if out_f > 0 and out_f % 3 == 0:
+                            hs = out_f // 3
+                            targets = [(norm, (seg * hs, (seg + 1) * hs))]
+                        else:
+                            targets = [(norm, None)]
+                    else:
+                        targets = [(norm, None)]
+            else:
+                targets = [(norm, None)]
             layer_matched = False
             seen = set()
             for target_path, qkv_slice in targets:
@@ -326,6 +351,24 @@ class INT4XPULoRALoader:
         # █ 原样保留 █
         A = down.to(cpu, torch.float16).clone()
         B = up.to(cpu, torch.float16).clone()
+        # 形状预检：LoRA out/in 必须匹配模块，否则在加载时一次性过滤，
+        # 避免条目进入 forward 热路径后每次白算矩阵乘再跳过刷屏。
+        if qkv_slice is not None:
+            target_out = qkv_slice[1] - qkv_slice[0]
+        else:
+            target_out = (module.out_features if hasattr(module, "out_features")
+                          else (module.weight.shape[0]
+                                if module.weight is not None else None))
+        target_in = (module.in_features if hasattr(module, "in_features")
+                     else (module.weight.shape[1]
+                           if module.weight is not None else None))
+        if (target_out is not None and B.shape[0] != target_out) or (
+                target_in is not None and A.shape[1] != target_in):
+            log.warning(
+                "[int4 LoRA] shape mismatch: LoRA=(out %s, in %s) vs "
+                "module=(out %s, in %s) (%s) — skip",
+                B.shape[0], A.shape[1], target_out, target_in, lora_name)
+            return
         if quarot_enabled and H is not None: A = _rot_quarot_tensor(A, H, group_size)
         rank = up.shape[1] if up.ndim >= 2 else 1
         mult = ((alpha_val / max(rank, 1)) if alpha_val else 1.0) * strength
@@ -345,8 +388,15 @@ class INT4XPULoRALoader:
             if le is None: le = {}; object.__setattr__(module, '_wa4_lora_entries', le)
             if qkv_slice is not None:
                 sl, se = qkv_slice
+                if B.shape[0] != (se - sl):
+                    # LoRA 的 B 是全量 fused qkv（out == 段总宽）→ 按段切
+                    B_seg = B[sl:se].contiguous().clone()
+                else:
+                    # LoRA 的 B 本身就是单段（to_q/to_k/to_v，out == 段宽）
+                    # → 不切，全量注入到 o 的 sl:se
+                    B_seg = B.contiguous().clone()
                 le.setdefault(lora_name, []).append(
-                    (A, B[sl:se].contiguous().clone(), mult, sl, se))
+                    (A, B_seg, mult, sl, se))
             else:
                 le.setdefault(lora_name, []).append((A, B, mult))
 
