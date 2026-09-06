@@ -403,9 +403,23 @@ class INT4XPULoRALoader:
     def _inject_lokr(self, module, lora_name, w1, w2, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False):
         # █ 原样保留 █
         w1_c = w1.to(cpu, torch.float16).clone(); w2_c = w2.to(cpu, torch.float16).clone()
-        delta = torch.kron(w1_c, w2_c)
         to2 = module.out_features if hasattr(module, "out_features") else module.weight.shape[0]
         ti2 = module.in_features if hasattr(module, "in_features") else module.weight.shape[1]
+        # ── LoKR 因子快速路径：不物化 kron(delta) ──────────────────────────
+        # 仅当 kron 行数==out 且输入宽正好是若干整段 w2 列（realism/Krea2 模式）
+        # 时使用；其余情形（bake/qkv 分片/quarot/不整除）原样走下方旧路径。
+        r1, c1 = w1_c.shape
+        r2, c2 = w2_c.shape
+        if (not bake and qkv_slice is None and not quarot_enabled
+                and r1 * r2 == to2 and ti2 % c2 == 0 and 0 < ti2 // c2 <= c1):
+            le = getattr(module, '_wa4_lora_entries', None)
+            if le is None:
+                le = {}
+                object.__setattr__(module, '_wa4_lora_entries', le)
+            le.setdefault(lora_name, []).append(
+                ("lokr", w1_c.contiguous(), w2_c.contiguous(), strength))
+            return
+        delta = torch.kron(w1_c, w2_c)
         if delta.shape[0] < to2: delta = delta.repeat((to2 + delta.shape[0] - 1) // delta.shape[0], 1)
         if delta.shape[0] > to2: delta = delta[:to2, :]
         if delta.shape[1] < ti2: delta = delta.repeat(1, (ti2 + delta.shape[1] - 1) // delta.shape[1])

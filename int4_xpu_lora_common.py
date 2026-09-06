@@ -45,7 +45,8 @@ def _normalize_layer_path(path: str) -> str | None:
         # v2.2：下划线格式——先保护复合名，再转分隔符，最后还原
         _GUARD = "@@"
         for c in ("add_k_proj", "add_q_proj", "add_v_proj", "to_add_out",
-                  "img_mlp", "txt_mlp", "img_mod", "txt_mod",
+                  "img_mlp", "txt_mlp", "img_attn", "txt_attn",
+                  "img_mod", "txt_mod",
                   "time_text_embed", "timestep_embedder",
                   "norm_added_k", "norm_added_q", "norm_k", "norm_q", "layer_norm"):
             path = path.replace(c, c.replace("_", _GUARD))

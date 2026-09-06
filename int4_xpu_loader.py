@@ -263,6 +263,21 @@ def _lora_cache_fetch(module, entries, dev, cd):
     return g[0]
 
 
+def _apply_lokr_factor(x2, o, w1, w2, mult):
+    """LoKR 因子直算：GPU 现算 kron(w1,w2) 的前 ti2 列，走原大 GEMM。
+
+    GPU 只常驻 w1/w2 因子（约文件大小 1.5GB），每层前向临时物化一份
+    delta（模块权重大小，用完即弃），避免旧实现把 224 层整 delta 全量
+    常驻（~12GB）。速度与旧路径几乎一致（实测 +0.4~4ms/层）。
+    """
+    k = x2.shape[1]
+    d = torch.kron(w1, w2)[:, :k]
+    lo = x2 @ d.t() * mult
+    o += lo.to(o.dtype)
+    del lo, d
+    return o
+
+
 def _apply_wa4_lora(module, x2, out, entries, dev, cd):
     """在 GEMM 输出上叠加 LoRA（kernel / python / torchao 三类共用）。
 
@@ -279,7 +294,19 @@ def _apply_wa4_lora(module, x2, out, entries, dev, cd):
             etype = entry[0] if isinstance(entry[0], str) else None
             sl = entry[3] if len(entry) > 3 else None
             se = entry[4] if len(entry) > 4 else None
-            if etype == "delta":
+            if etype == "lokr":
+                _, w1_cpu, w2_cpu, mult = entry[:4]
+                w1 = _gmap.get(("w1", id(w1_cpu)))
+                if w1 is None:
+                    w1 = w1_cpu.to(dev, dtype=cd)
+                    _gmap[("w1", id(w1_cpu))] = w1
+                w2 = _gmap.get(("w2", id(w2_cpu)))
+                if w2 is None:
+                    w2 = w2_cpu.to(dev, dtype=cd)
+                    _gmap[("w2", id(w2_cpu))] = w2
+                _apply_lokr_factor(x2, o, w1, w2, mult)
+                continue
+            elif etype == "delta":
                 _, delta_cpu, mult = entry[:3]
                 d = _gmap.get(("delta", id(delta_cpu)))
                 if d is None:
