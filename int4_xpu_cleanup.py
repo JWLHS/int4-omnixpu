@@ -1,20 +1,36 @@
-"""Unload hook: make ComfyUI cleanup also release CPU models + int4 refs.
+"""Cleanup dispatcher for int4 plugin.
 
-ComfyUI's ``unload_all_models()`` only walks GPU devices, so cleanup nodes and
-buttons leave CPU-resident text encoders registered. The int4 model graph is
-also pinned by this plugin's ``_norm_idx_cache``. This hook:
-
-1. runs the original unload (GPU models);
-2. frees cpu-device entries (text encoders/VAE on CPU);
-3. clears the int4 lora-index cache and class-level prewarm refs;
-4. gc + xpu/aimdo cache release + CRT heap release;
+ComfyUI calls ``unload_all_models()`` at the end of every prompt when
+``--disable-smart-memory`` is active. That automatic call must keep the int4
+XPU weights resident so repeated runs stay fast (old "Krea2 常驻保速度"
+behaviour). Explicit cleanup entry points (buttons/nodes) must instead do a
+full release: cpu-device text encoders, int4 global refs, aimdo pool and the
+CRT heap.
 """
 import gc
 import logging
+import traceback
 
 log = logging.getLogger("int4-cleanup")
 
 _orig_unload_all_models = None
+_force_release = False
+
+
+def is_comfy_auto_unload():
+    """True when unload_all_models comes from ComfyUI's prompt-end auto unload
+    (execution.py, DISABLE_SMART_MEMORY path)."""
+    try:
+        for f in traceback.extract_stack(limit=10):
+            if f.filename.replace("\\", "/").endswith("execution.py"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def is_force_release_active():
+    return _force_release
 
 
 def _heapmin():
@@ -55,12 +71,35 @@ def _clear_int4_refs():
     return cleared
 
 
+def _release_resident_int4():
+    """Force-release int4 XPU weights kept for warm reuse (auto-unload kept
+    them resident and they are no longer in ComfyUI's current_loaded_models)."""
+    try:
+        from .int4_xpu_loader import INT4XPULinear, Int4LinearPython, Int4LinearTorchao
+        target = INT4XPULinear._prewarm_target
+        if target is not None:
+            for m in target.modules():
+                try:
+                    if isinstance(m, INT4XPULinear):
+                        m.release_xpu()
+                    elif isinstance(m, (Int4LinearPython, Int4LinearTorchao)):
+                        object.__setattr__(m, "_wa4_lora_gpu", None)
+                except Exception:
+                    pass
+        INT4XPULinear._prewarm_target = None
+        INT4XPULinear._prewarm_done = False
+    except Exception:
+        pass
+
+
 def _release(deep=False):
     try:
         gc.collect()
         from comfy import model_management as mm
         mm.soft_empty_cache()
         _aimdo_empty()
+        if deep:
+            _release_resident_int4()
         n = _clear_int4_refs()
         gc.collect()
         _heapmin()
@@ -75,7 +114,17 @@ def _release(deep=False):
 
 
 def _unload_all_models():
-    result = _orig_unload_all_models() if _orig_unload_all_models is not None else None
+    global _force_release
+    if is_comfy_auto_unload():
+        # Prompt-end automatic unload: keep int4 weights resident for warm
+        # reuse. Still run the original unload so ComfyUI's model registry is
+        # correct, but skip CPU/plugin deep cleanup.
+        return _orig_unload_all_models() if _orig_unload_all_models is not None else None
+    _force_release = True
+    try:
+        result = _orig_unload_all_models() if _orig_unload_all_models is not None else None
+    finally:
+        _force_release = False
     try:
         import torch
         from comfy import model_management as mm

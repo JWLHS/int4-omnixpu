@@ -1908,24 +1908,38 @@ class int4XPUModelLoader:
         _o_detach = model.detach
         def _wa4_detach(unpatch_all=True):
             try:
+                force_release = False
+                auto_unload = False
+                try:
+                    from .int4_xpu_cleanup import is_force_release_active, is_comfy_auto_unload
+                    force_release = is_force_release_active()
+                    auto_unload = is_comfy_auto_unload()
+                except Exception:
+                    pass
+                keep_resident = (not force_release) and auto_unload
                 dm = model.model.diffusion_model
                 while hasattr(dm, '_orig_mod'):
                     dm = dm._orig_mod
                 for m in dm.modules():
                     try:
                         if isinstance(m, INT4XPULinear):
-                            if not _aimdo_manages():
+                            if not _aimdo_manages() and not keep_resident:
                                 m.release_xpu()
-                            else:
+                            elif not keep_resident:
                                 object.__setattr__(m, "_wa4_lora_gpu", None)
                         elif isinstance(m, (Int4LinearPython, Int4LinearTorchao)):
                             # 回退类无 release_xpu，只清 LoRA GPU 缓存
-                            object.__setattr__(m, "_wa4_lora_gpu", None)
+                            if not keep_resident:
+                                object.__setattr__(m, "_wa4_lora_gpu", None)
                     except Exception:
                         pass
-                INT4XPULinear._prewarm_target = None
-                INT4XPULinear._prewarm_done = False
-                if not _aimdo_manages():
+                if keep_resident:
+                    # 自动卸载（同模型热重用）：权重常驻，仅复位 prewarm 状态
+                    INT4XPULinear._prewarm_done = False
+                else:
+                    INT4XPULinear._prewarm_target = None
+                    INT4XPULinear._prewarm_done = False
+                if not _aimdo_manages() and not keep_resident:
                     torch.xpu.synchronize()
                     torch.xpu.empty_cache()
             except Exception:
