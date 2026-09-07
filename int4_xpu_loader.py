@@ -1911,9 +1911,9 @@ class int4XPUModelLoader:
                 force_release = False
                 auto_unload = False
                 try:
-                    from .int4_xpu_cleanup import is_force_release_active, is_comfy_auto_unload
+                    from .int4_xpu_cleanup import is_force_release_active, is_auto_unload_active
                     force_release = is_force_release_active()
-                    auto_unload = is_comfy_auto_unload()
+                    auto_unload = is_auto_unload_active()
                 except Exception:
                     pass
                 keep_resident = (not force_release) and auto_unload
@@ -1948,6 +1948,11 @@ class int4XPUModelLoader:
         object.__setattr__(model, 'detach', _wa4_detach)
 
         log.info("[int4] Load complete (dtype=%s, backend=%s)", act_dtype, backend)
+        try:
+            from .int4_xpu_cleanup import mark_plugin_used
+            mark_plugin_used()
+        except Exception:
+            pass
         _tphase("load complete", _t)
         _ram_trace("load complete")
         return (model,)

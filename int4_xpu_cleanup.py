@@ -15,22 +15,45 @@ log = logging.getLogger("int4-cleanup")
 
 _orig_unload_all_models = None
 _force_release = False
+_auto_unload_in_progress = False
+_plugin_used = False
+
+
+def mark_plugin_used():
+    global _plugin_used
+    _plugin_used = True
 
 
 def is_comfy_auto_unload():
     """True when unload_all_models comes from ComfyUI's prompt-end auto unload
-    (execution.py, DISABLE_SMART_MEMORY path)."""
+    (execution.py DISABLE_SMART_MEMORY block, independent of wrapper order)."""
     try:
-        for f in traceback.extract_stack(limit=10):
+        for f in traceback.extract_stack(limit=12):
             if f.filename.replace("\\", "/").endswith("execution.py"):
-                return True
+                if 820 <= f.lineno <= 860:
+                    return True
     except Exception:
         pass
     return False
 
 
+def is_auto_unload_active():
+    return _auto_unload_in_progress
+
+
 def is_force_release_active():
     return _force_release
+
+
+def _int4_present():
+    """True only when this plugin actually loaded an int4 model in the session
+    (prewarm target is kept while weights stay resident for warm reuse and
+    cleared on explicit release)."""
+    try:
+        from .int4_xpu_loader import INT4XPULinear
+        return _plugin_used or INT4XPULinear._prewarm_target is not None
+    except Exception:
+        return _plugin_used
 
 
 def _heapmin():
@@ -77,6 +100,7 @@ def _release_resident_int4():
     try:
         from .int4_xpu_loader import INT4XPULinear, Int4LinearPython, Int4LinearTorchao
         target = INT4XPULinear._prewarm_target
+        had_target = target is not None
         if target is not None:
             for m in target.modules():
                 try:
@@ -88,18 +112,22 @@ def _release_resident_int4():
                     pass
         INT4XPULinear._prewarm_target = None
         INT4XPULinear._prewarm_done = False
+        return had_target
     except Exception:
-        pass
+        return False
 
 
 def _release(deep=False):
+    global _plugin_used
+    active = _int4_present()
+    released_resident = False
     try:
         gc.collect()
         from comfy import model_management as mm
         mm.soft_empty_cache()
         _aimdo_empty()
         if deep:
-            _release_resident_int4()
+            released_resident = _release_resident_int4()
         n = _clear_int4_refs()
         gc.collect()
         _heapmin()
@@ -108,18 +136,25 @@ def _release(deep=False):
             ctypes.windll.kernel32.SetProcessWorkingSetSize(
                 ctypes.windll.kernel32.GetCurrentProcess(), -1, -1
             )
-        log.info("[int4-cleanup] released (int4 cache entries=%d)", n)
+        if active or released_resident or n:
+            log.info("[int4-cleanup] released (int4 cache entries=%d)", n)
+            _plugin_used = False
     except Exception:
         pass
 
 
 def _unload_all_models():
-    global _force_release
-    if is_comfy_auto_unload():
+    global _force_release, _auto_unload_in_progress
+    auto = is_comfy_auto_unload()
+    if not _int4_present() or auto:
         # Prompt-end automatic unload: keep int4 weights resident for warm
-        # reuse. Still run the original unload so ComfyUI's model registry is
-        # correct, but skip CPU/plugin deep cleanup.
-        return _orig_unload_all_models() if _orig_unload_all_models is not None else None
+        # reuse. For workflows that never used this plugin, just delegate to
+        # ComfyUI unchanged.
+        _auto_unload_in_progress = auto
+        try:
+            return _orig_unload_all_models() if _orig_unload_all_models is not None else None
+        finally:
+            _auto_unload_in_progress = False
     _force_release = True
     try:
         result = _orig_unload_all_models() if _orig_unload_all_models is not None else None
@@ -144,6 +179,6 @@ def apply_cleanup_patch():
         _orig_unload_all_models = mm.unload_all_models
         mm.unload_all_models = _unload_all_models
         mm._int4xpu_unload_patched = True
-        log.info("[int4] cleanup hook active")
+        log.debug("[int4] cleanup hook active")
     except Exception as e:
         log.warning("[int4] cleanup hook apply failed: %r", e)
