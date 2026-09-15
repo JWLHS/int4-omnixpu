@@ -371,8 +371,9 @@ def _wa4_arm_prewarm(model):
 def _wa4_release_model(model):
     """模型卸载时的显存处理（语义与旧版 detach 包装一致）。
 
-    - 非 AIMDO 且非"同模型热重用"：释放每层 XPU 权重副本 + sync/empty_cache
-    - AIMDO 接管：让路，只清 LoRA 的 GPU 缓存
+    - 换模型 / 显式释放（keep_resident=False）：无论是否 AIMDO，逐层收回 XPU
+      权重副本（只丢引用，权重退回 CPU；AIMDO 下不 sync / empty_cache）
+    - 提示词结束的自动卸载（keep_resident=True）：保留副本，维持同模型热启动
     - 复位/清空 prewarm 目标（下次用时重新批量搬入）
     """
     force_release = False
@@ -390,10 +391,13 @@ def _wa4_release_model(model):
     for m in dm.modules():
         try:
             if isinstance(m, INT4XPULinear):
-                if not _aimdo_manages() and not keep_resident:
+                if not keep_resident:
+                    # 以前 AIMDO 接管时这里整句跳过（"让路"），但 AIMDO 并不会在
+                    # 模型切换时归还这份设备内存：实测同进程从 tint4 切到 wa4，
+                    # 设备占用从 6421MB 叠到 12600MB（+一整个模型），再切第三个
+                    # 模型就 OOM → DEVICE_LOST。关掉 AIMDO 时同一序列只涨 108MB，
+                    # 说明责任就在这一步被跳过。
                     m.release_xpu()
-                elif not keep_resident:
-                    object.__setattr__(m, "_wa4_lora_gpu", None)
             elif isinstance(m, (Int4LinearPython, Int4LinearTorchao)):
                 if not keep_resident:
                     object.__setattr__(m, "_wa4_lora_gpu", None)
