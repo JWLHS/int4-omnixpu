@@ -250,6 +250,18 @@ then **our local test settings (reference only)** and why:
 
 ## Changelog
 
+- 2026-09-15: Fix "second sampling in the same run loses the LoRA". Unloading a
+  model (AIMDO VRAM reclaim, node-boundary trim, manual free — this happens
+  between the two sampling stages of a two-pass workflow) clears the LoRA state,
+  while ComfyUI has already cached the LoRA node and will not run it again, so
+  the second sampler silently used a LoRA-free model (measured on Krea2 wa4:
+  LoRA vs no-LoRA output was pixel-identical). The LoRA is now registered when
+  the unload clears it and is automatically re-applied on the model's next
+  forward (same run only — a new run drops the registration), with baked layers
+  swapped in immediately, matching a native node injection. The "skip duplicate
+  injection at the same strength" fast path now also verifies the LoRA state is
+  still alive before skipping (this also fixes reloading a LoRA after a
+  strength=0 removal).
 - 2026-08-30: F2K (flux-2-klein-9b) quantization quality fix — the flux2
   quantizer exclusion list now keeps `img_attn.qkv/proj`, the last double
   block and the first/last single blocks at full precision (located by a

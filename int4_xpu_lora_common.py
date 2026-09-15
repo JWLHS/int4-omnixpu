@@ -184,14 +184,29 @@ def _parse_raw_lora_sd(lora_sd: dict) -> dict[str, dict]:
     return lora_data
 
 
-def _wa4_reset_all_loras(model) -> None:
-    """Full reset: INT4XPULinear entries + bake-state rollback."""
+def _wa4_reset_all_loras(model, schedule_reapply: bool = False) -> None:
+    """Full reset: INT4XPULinear entries + bake-state rollback.
+
+    schedule_reapply=True（模型卸载路径）：把当前 LoRA 期望状态登记给
+    int4_xpu_loader 的重放表 —— 同一次运行内模型被卸载后重新加载时，LoRA
+    节点已经执行过不会重跑，只能由模型下次前向自动装回（否则第二次采样
+    会静默失去 LoRA）。节点自身的 reset（schedule_reapply=False）不登记，
+    因为紧接着就会重新注入。
+    """
     bm = model.model
     while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
     cpu = torch.device("cpu")
+    specs, layers = [], []
+    if schedule_reapply:
+        for x in (getattr(model.model, "_wa4_loras", None) or []):
+            if isinstance(x, dict) and x.get("name"):
+                specs.append((x["name"], x.get("strength", 1.0)))
     for m in bm.modules():
         if _is_quant_linear(m):
             object.__setattr__(m, '_wa4_lora_entries', None)
+            if schedule_reapply: layers.append(id(m))
+        elif schedule_reapply and isinstance(m, torch.nn.Linear):
+            layers.append(id(m))
         bs = getattr(m, '_wa4_bake_state', None)
         if bs is None: continue
         hh = bs.pop('_hook_handle', None)
@@ -211,5 +226,26 @@ def _wa4_reset_all_loras(model) -> None:
         bs.pop('_pending', None)
         bs.clear()
     object.__setattr__(model.model, '_wa4_loras', [])
+    if specs and layers:
+        from .int4_xpu_loader import _wa4_lora_replay_schedule
+        _wa4_lora_replay_schedule(model, specs, layers)
     log.info("[int4 LoRA] All LoRA entries cleared")
 
+
+def _wa4_lora_state_live(model, lora_name: str) -> bool:
+    """去重跳过前的存活校验。
+
+    只在"该 LoRA 的量化条目或 bake 记录确实还在模型上"时才允许跳过重复
+    注入；状态被清空（卸载、strength=0 移除等）而 `_wa4_loras` 记录还在时
+    必须重新注入，否则会静默失去 LoRA。
+    """
+    bm = model.model
+    while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
+    for m in bm.modules():
+        le = getattr(m, '_wa4_lora_entries', None)
+        if le and lora_name in le:
+            return True
+        bs = getattr(m, '_wa4_bake_state', None)
+        if bs and lora_name in bs:
+            return True
+    return False

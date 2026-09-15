@@ -9,11 +9,11 @@ v1.1: Multi-LoRA injection (≤8). Same bake rollback + dedup logic as Loader.
 import time, logging
 import torch, torch.nn as nn
 import folder_paths, comfy.utils
-from .int4_xpu_loader import _is_quant_linear
+from .int4_xpu_loader import _is_quant_linear, _wa4_lora_replay_drop
 from .int4_xpu_lora_common import (
     _wa4_reset_all_loras, _auto_detect_format, _convert_bfl_to_standard,
     _parse_raw_lora_sd, _get_accelerator_device, _rot_quarot_tensor,
-    _resolve_with_alias,
+    _resolve_with_alias, _wa4_lora_state_live,
 )
 from .int4_xpu_lora_loader import _resolve_qkv_slices, _make_bake_pre_hook
 
@@ -44,6 +44,8 @@ class INT4XPULoRAStack:
     FUNCTION = "apply"
 
     def apply(self, model, **kwargs):
+        # 节点执行 = 本次运行的真实意图：丢弃卸载前登记的重放
+        _wa4_lora_replay_drop(model)
         to_apply = []
         for i in range(1, 9):
             n = kwargs.get(f"lora_name_{i}")
@@ -78,7 +80,7 @@ class INT4XPULoRAStack:
             # █ 原样保留（detach 清缓存逻辑，不动）█
             _orig_detach = model.detach
             def _wa4_detach(unpatch_all=True):
-                _wa4_reset_all_loras(model)
+                _wa4_reset_all_loras(model, schedule_reapply=True)
                 object.__setattr__(model.model, '_wa4_lora_needs_reset', True)
                 return _orig_detach(unpatch_all)
             object.__setattr__(model, 'detach', _wa4_detach)
@@ -90,15 +92,18 @@ class INT4XPULoRAStack:
 
         for lora_name, lora_path, strength in to_apply:
             # 同 LoRA 同强度已注入 → 跳过（避免每轮重建 entries + GPU 缓存碎片化）
-            if any(
+            _dup = any(
                 isinstance(x, dict)
                 and x.get("name") == lora_name
                 and x.get("path") == lora_path
                 and abs(float(x.get("strength", 1.0)) - float(strength)) < 1e-5
                 for x in prev_applied
-            ):
-                log.info("[int4 Stack] %s 已按 strength=%.2f 注入，跳过", lora_name, strength)
-                continue
+            )
+            if _dup:
+                if _wa4_lora_state_live(model, lora_name):
+                    log.info("[int4 Stack] %s 已按 strength=%.2f 注入，跳过", lora_name, strength)
+                    continue
+                log.info("[int4 Stack] %s 记录仍在但 LoRA 状态已被清空 → 重新注入", lora_name)
             t0 = time.perf_counter()
             lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
             fmt = _auto_detect_format(lora_sd)
@@ -178,6 +183,7 @@ class INT4XPULoRAStack:
                 except Exception: pass
         bs.pop(lora_name, None)
         bs.pop('_pending', None)
+        bs.pop('_bake_now', None)
         hh = bs.pop('_hook_handle', None)
         if hh is not None:
             try: hh.remove()
@@ -198,9 +204,12 @@ class INT4XPULoRAStack:
             sl = qkv_slice[0] if qkv_slice else None
             se = qkv_slice[1] if qkv_slice else None
             pending.append((A, B, mult, sl, se))
+            bs[lora_name] = True   # 存活标记（_wa4_lora_state_live / _pop_module_lora 用）
             if '_hook_handle' not in bs:
-                hook = module.register_forward_pre_hook(_make_bake_pre_hook(module))
+                _bake_fn = _make_bake_pre_hook(module)
+                hook = module.register_forward_pre_hook(_bake_fn)
                 bs['_hook_handle'] = hook
+                bs['_bake_now'] = _bake_fn   # 卸载重放时立即补齐（避免早于 int4 层的 baked 层漏掉首个 step）
         else:
             le = getattr(module, '_wa4_lora_entries', None)
             if le is None: le = {}; object.__setattr__(module, '_wa4_lora_entries', le)
@@ -244,9 +253,12 @@ class INT4XPULoRAStack:
             sl = qkv_slice[0] if qkv_slice else None
             se = qkv_slice[1] if qkv_slice else None
             pending.append(("delta", delta, strength, sl, se))
+            bs[lora_name] = True   # 存活标记（_wa4_lora_state_live / _pop_module_lora 用）
             if '_hook_handle' not in bs:
-                hook = module.register_forward_pre_hook(_make_bake_pre_hook(module))
+                _bake_fn = _make_bake_pre_hook(module)
+                hook = module.register_forward_pre_hook(_bake_fn)
                 bs['_hook_handle'] = hook
+                bs['_bake_now'] = _bake_fn   # 卸载重放时立即补齐（避免早于 int4 层的 baked 层漏掉首个 step）
         else:
             le = getattr(module, '_wa4_lora_entries', None)
             if le is None: le = {}; object.__setattr__(module, '_wa4_lora_entries', le)
@@ -260,4 +272,3 @@ class INT4XPULoRAStack:
 
 NODE_CLASS_MAPPINGS = {"INT4XPULoRAStack": INT4XPULoRAStack}
 NODE_DISPLAY_NAME_MAPPINGS = {"INT4XPULoRAStack": "INT4XPU LoRA Stack (up to 8)"}
-

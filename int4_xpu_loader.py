@@ -155,6 +155,7 @@ class Int4LinearPython(nn.Module):
 
     def forward(self, x):
         global _TAO_ERR_PRINTED
+        _wa4_lora_replay_tick(self)
         dev = x.device
         x2 = x.reshape(-1, x.shape[-1]).to(self._act_dtype)
         if self._use_quarot and self._hadamard_H is not None:
@@ -197,6 +198,7 @@ class Int4LinearTorchao(nn.Module):
         object.__setattr__(self, "_wa4_lora_gpu", None)
 
     def forward(self, x):
+        _wa4_lora_replay_tick(self)
         dev = x.device
         x2 = x.reshape(-1, x.shape[-1])
         if self._use_quarot and self._hadamard_H is not None:
@@ -261,6 +263,110 @@ def _lora_cache_fetch(module, entries, dev, cd):
         g = ({}, id(entries), (dev, cd))
         object.__setattr__(module, "_wa4_lora_gpu", g)
     return g[0]
+
+
+# ── LoRA 卸载重放（v1.1）──────────────────────────────────────────────
+# detach（模型卸载：AIMDO 显存回收 / 节点边界 trim / 手动释放）会清空 LoRA
+# 状态，而 ComfyUI 里已经执行过的 LoRA 节点不会重跑 —— 于是"同一次运行内的
+# 第二次采样"会静默失去 LoRA（Krea2 int8 双采实测：卸载后条目清零，日志无
+# 任何重新注入）。这里在清空时登记"卸载前应有的 LoRA"，模型下次前向时自动
+# 重放；登记只对同一次运行有效，进入新的一次运行（prompt id 变化）即丢弃，
+# 不会把上一次运行的 LoRA 带进新工作流。
+_WA4_LORA_REPLAY = {}            # id(base_model) -> {"ref","specs","layers","prompt"}
+_WA4_LORA_REPLAY_LAYERS = set()  # 层 id 快查表：前向热路径只做一次集合判断
+_WA4_LORA_REPLAY_RUNNING = False
+
+
+def _wa4_prompt_id():
+    """当前 prompt id（把重放限制在同一次运行内用）。"""
+    try:
+        from server import PromptServer
+        return getattr(PromptServer.instance, "last_prompt_id", None)
+    except Exception:
+        return None
+
+
+def _wa4_lora_replay_reindex():
+    _WA4_LORA_REPLAY_LAYERS.clear()
+    for e in _WA4_LORA_REPLAY.values():
+        _WA4_LORA_REPLAY_LAYERS.update(e["layers"])
+
+
+def _wa4_lora_replay_schedule(model, specs, layers):
+    """登记"卸载前应有的 LoRA"，供模型下次前向自动重放。"""
+    if not specs or not layers:
+        return
+    import weakref
+    try:
+        ref = weakref.ref(model)
+    except TypeError:
+        return
+    # 顺手清掉已经被 GC 的旧登记，避免表无限增长
+    for k in [k for k, e in _WA4_LORA_REPLAY.items() if e["ref"]() is None]:
+        _WA4_LORA_REPLAY.pop(k, None)
+    bm = model.model
+    while hasattr(bm, '_orig_mod'):
+        bm = bm._orig_mod
+    _WA4_LORA_REPLAY[id(bm)] = {
+        "ref": ref, "specs": list(specs), "layers": set(layers),
+        "prompt": _wa4_prompt_id(),
+    }
+    _wa4_lora_replay_reindex()
+    log.info("[int4 LoRA] 卸载已清空 LoRA（%d 个）→ 登记重放，模型下次前向自动装回",
+             len(specs))
+
+
+def _wa4_lora_replay_drop(model):
+    """节点执行（= 本次运行的真实意图）后丢弃该模型的重放登记。"""
+    bm = getattr(model, "model", None)
+    if bm is None:
+        return
+    while hasattr(bm, '_orig_mod'):
+        bm = bm._orig_mod
+    if _WA4_LORA_REPLAY.pop(id(bm), None) is not None:
+        _wa4_lora_replay_reindex()
+
+
+def _wa4_lora_replay_tick(module):
+    """前向热路径调用：没有待重放时只是一次空集合判断。"""
+    if not _WA4_LORA_REPLAY_LAYERS:
+        return
+    if id(module) not in _WA4_LORA_REPLAY_LAYERS:
+        return
+    _wa4_lora_replay_run(module)
+
+
+def _wa4_lora_replay_run(module):
+    global _WA4_LORA_REPLAY_RUNNING
+    if _WA4_LORA_REPLAY_RUNNING:
+        return
+    key = None
+    for k, e in _WA4_LORA_REPLAY.items():
+        if id(module) in e["layers"]:
+            key = k
+            break
+    if key is None:
+        _wa4_lora_replay_reindex()
+        return
+    entry = _WA4_LORA_REPLAY.pop(key, None)
+    _wa4_lora_replay_reindex()
+    if entry is None:
+        return
+    model = entry["ref"]()
+    if model is None:
+        return
+    cur = _wa4_prompt_id()
+    if entry["prompt"] is not None and cur is not None and entry["prompt"] != cur:
+        log.info("[int4 LoRA] 已进入新的一次运行 → 丢弃上一次运行遗留的 LoRA 重放登记")
+        return
+    _WA4_LORA_REPLAY_RUNNING = True
+    try:
+        from .int4_xpu_lora_loader import _wa4_lora_replay_apply
+        _wa4_lora_replay_apply(model, entry["specs"])
+    except Exception as e:
+        log.warning("[int4 LoRA] 卸载重放失败：%s", e)
+    finally:
+        _WA4_LORA_REPLAY_RUNNING = False
 
 
 def _apply_lokr_factor(x2, o, w1, w2, mult):
@@ -1038,6 +1144,7 @@ class INT4XPULinear(nn.Module):
             pass
 
     def forward(self, x):
+        _wa4_lora_replay_tick(self)
         INT4XPULinear._prewarm_once(getattr(x, "device", None))
         self._prepare()
         from omni_xpu_kernel import svdq

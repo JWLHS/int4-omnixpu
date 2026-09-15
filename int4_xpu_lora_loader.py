@@ -14,11 +14,13 @@ v3.0: pre-hook bake (deferred GPU compute, no CPU stall).
 import time, logging
 import torch, torch.nn as nn, re
 import folder_paths, comfy.utils
-from .int4_xpu_loader import _is_quant_linear
+from .int4_xpu_loader import (
+    _is_quant_linear, _wa4_lora_replay_tick, _wa4_lora_replay_drop,
+)
 from .int4_xpu_lora_common import (
     _wa4_reset_all_loras, _auto_detect_format, _convert_bfl_to_standard,
     _parse_raw_lora_sd, _get_accelerator_device, _rot_quarot_tensor,
-    _resolve_with_alias,
+    _resolve_with_alias, _wa4_lora_state_live,
 )
 
 log = logging.getLogger("int4-LoRA")
@@ -48,6 +50,8 @@ def _resolve_qkv_slices(index, norm):
 
 def _make_bake_pre_hook(module: nn.Module):
     def _pre_hook(_mod, _inputs):
+        # 卸载重放要先跑：本层的 bake 条目可能正是重放刚装进来的
+        _wa4_lora_replay_tick(module)
         bs = getattr(module, '_wa4_bake_state', None)
         if bs is None: return
         pending = bs.get('_pending')
@@ -155,6 +159,7 @@ def _make_bake_pre_hook(module: nn.Module):
             log.warning("[int4 LoRA] bake pre-hook failed: %s", e)
         bs.pop('_pending', None)
         bs['_applied'] = applied
+        bs.pop('_bake_now', None)
         hh = bs.pop('_hook_handle', None)
         if hh is not None: hh.remove()
     return _pre_hook
@@ -185,6 +190,9 @@ class INT4XPULoRALoader:
     FUNCTION = "load_lora"
 
     def load_lora(self, model, lora_name, strength):
+        # 节点执行 = 本次运行的真实意图：先丢弃卸载前登记的重放，避免旧 LoRA
+        # 在新的一次运行里被自动装回
+        _wa4_lora_replay_drop(model)
         if getattr(model.model, '_wa4_lora_needs_reset', False):
             _wa4_reset_all_loras(model)
             object.__setattr__(model.model, '_wa4_lora_needs_reset', False)
@@ -206,9 +214,12 @@ class INT4XPULoRALoader:
             and abs(float(x.get("strength", 1.0)) - float(strength)) < 1e-5
             for x in _prev
         ):
-            log.info("[int4 LoRA] ✓ %s 已按 strength=%.2f 注入，跳过重复注入",
-                     lora_name, strength)
-            return (model,)
+            if _wa4_lora_state_live(model, lora_name):
+                log.info("[int4 LoRA] ✓ %s 已按 strength=%.2f 注入，跳过重复注入",
+                         lora_name, strength)
+                return (model,)
+            log.info("[int4 LoRA] %s 记录仍在但 LoRA 状态已被清空 → 重新注入",
+                     lora_name)
 
         base_model = model.model
         while hasattr(base_model, '_orig_mod'): base_model = base_model._orig_mod
@@ -233,7 +244,7 @@ class INT4XPULoRALoader:
             # █ 原样保留（detach 清缓存逻辑，不动）█
             _orig_detach = model.detach
             def _wa4_detach(unpatch_all=True):
-                _wa4_reset_all_loras(model)
+                _wa4_reset_all_loras(model, schedule_reapply=True)
                 object.__setattr__(model.model, '_wa4_lora_needs_reset', True)
                 return _orig_detach(unpatch_all)
             object.__setattr__(model, 'detach', _wa4_detach)
@@ -335,17 +346,21 @@ class INT4XPULoRALoader:
                 except Exception: pass
         bs.pop(lora_name, None)
         bs.pop('_pending', None)
+        bs.pop('_bake_now', None)
         hh = bs.pop('_hook_handle', None)
         if hh is not None:
             try: hh.remove()
             except Exception: pass
 
     def _remove_lora(self, model, lora_name):
-        # █ 原样保留 █
+        # █ 原样保留（额外：同步撤掉去重记录，否则再次加载同名 LoRA 会被误判为已注入）█
         bm = model.model
         while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
         for m in bm.modules():
             self._pop_module_lora(m, lora_name)
+        keep = [x for x in (getattr(model.model, '_wa4_loras', None) or [])
+                if not (isinstance(x, dict) and x.get("name") == lora_name)]
+        object.__setattr__(model.model, '_wa4_loras', keep)
 
     def _inject_standard(self, module, lora_name, down, up, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False):
         # █ 原样保留 █
@@ -380,9 +395,12 @@ class INT4XPULoRALoader:
             sl = qkv_slice[0] if qkv_slice else None
             se = qkv_slice[1] if qkv_slice else None
             pending.append((A, B, mult, sl, se))
+            bs[lora_name] = True   # 存活标记（_wa4_lora_state_live / _pop_module_lora 用）
             if '_hook_handle' not in bs:
-                hook = module.register_forward_pre_hook(_make_bake_pre_hook(module))
+                _bake_fn = _make_bake_pre_hook(module)
+                hook = module.register_forward_pre_hook(_bake_fn)
                 bs['_hook_handle'] = hook
+                bs['_bake_now'] = _bake_fn   # 卸载重放时立即补齐（避免早于 int4 层的 baked 层漏掉首个 step）
         else:
             le = getattr(module, '_wa4_lora_entries', None)
             if le is None: le = {}; object.__setattr__(module, '_wa4_lora_entries', le)
@@ -435,9 +453,12 @@ class INT4XPULoRALoader:
             sl = qkv_slice[0] if qkv_slice else None
             se = qkv_slice[1] if qkv_slice else None
             pending.append(("delta", delta, strength, sl, se))
+            bs[lora_name] = True   # 存活标记（_wa4_lora_state_live / _pop_module_lora 用）
             if '_hook_handle' not in bs:
-                hook = module.register_forward_pre_hook(_make_bake_pre_hook(module))
+                _bake_fn = _make_bake_pre_hook(module)
+                hook = module.register_forward_pre_hook(_bake_fn)
                 bs['_hook_handle'] = hook
+                bs['_bake_now'] = _bake_fn   # 卸载重放时立即补齐（避免早于 int4 层的 baked 层漏掉首个 step）
         else:
             le = getattr(module, '_wa4_lora_entries', None)
             if le is None: le = {}; object.__setattr__(module, '_wa4_lora_entries', le)
@@ -447,6 +468,53 @@ class INT4XPULoRALoader:
                     ("delta", delta[sl:se, :].contiguous().clone(), strength, sl, se))
             else:
                 le.setdefault(lora_name, []).append(("delta", delta, strength))
+
+
+def _wa4_lora_replay_apply(model, specs):
+    """模型卸载清空 LoRA 后，在下一次前向之前把同一次运行内的 LoRA 装回。
+
+    走与节点完全相同的注入路径（含去重记录写入），因此状态与"节点刚执行过"
+    等价；重读文件约 0.1~0.2s/LoRA，只在确实发生卸载+继续采样时发生一次。
+    """
+    loader = INT4XPULoRALoader()
+    names = []
+    for name, strength in specs:
+        try:
+            loader.load_lora(model, name, strength)
+            names.append(name)
+        except Exception as e:
+            log.warning("[int4 LoRA] 重放 %s 失败：%s", name, e)
+    _wa4_lora_replay_flush_bakes(model)
+    if names:
+        log.info("[int4 LoRA] ↩ 卸载后自动装回 %d 个 LoRA（同一次运行内）：%s",
+                 len(names), ", ".join(names))
+
+
+def _wa4_lora_replay_flush_bakes(model):
+    """把重放刚排队的 baked delta 立即落盘到权重。
+
+    正常路径下 bake 由各层 forward pre-hook 在"该层首次前向"时执行；重放发生
+    在某层前向内部，早于首个 int4 层的 baked 层已经跑过本步前向，会漏掉首个
+    step 的 delta（实测图像残差 mean≈0.7/255）。这里在重放结束时统一立即执行，
+    使重放结果与"节点刚执行过"完全一致。
+    """
+    bm = model.model
+    while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
+    n = 0
+    for m in bm.modules():
+        bs = getattr(m, '_wa4_bake_state', None)
+        if not bs or not bs.get('_pending'):
+            continue
+        fn = bs.get('_bake_now')
+        if fn is None:
+            continue
+        try:
+            fn(m, None)
+            n += 1
+        except Exception as e:
+            log.warning("[int4 LoRA] 重放 bake 立即执行失败（将由 pre-hook 兜底）：%s", e)
+    if n:
+        log.info("[int4 LoRA] 重放：%d 个 baked 层已立即换权（与原生注入等价）", n)
 
 
 NODE_CLASS_MAPPINGS = {"INT4XPULoRALoader": INT4XPULoRALoader}
