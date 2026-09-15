@@ -60,7 +60,7 @@ class INT4XPULoRAStack:
             _wa4_reset_all_loras(model)
             object.__setattr__(model.model, '_wa4_lora_needs_reset', False)
         if not to_apply:
-            log.info("[int4 Stack] = 没有启用的 LoRA（未填或强度 0），跳过")
+            log.debug("[int4 Stack] 没有启用的 LoRA（未填或强度 0），跳过")
             return (model,)
 
         base_model = model.model
@@ -100,15 +100,16 @@ class INT4XPULoRAStack:
                 and abs(float(x.get("strength", 1.0)) - float(strength)) < 1e-5
             ), None)
             if _rec is not None:
+                _q = int(_rec.get("quant") or 0)
+                _b = int(_rec.get("bake") or 0)
                 if _rec.get("layers") == 0:
-                    log.info("[int4 Stack] = %s 上次匹配 0 层（模型里没有对应层），跳过重复尝试",
-                             lora_name)
+                    log.debug("[int4 Stack] %s 与当前模型不匹配（0 层），跳过", lora_name)
                     continue
                 if _wa4_lora_state_live(model, lora_name):
-                    log.info("[int4 Stack] = %s 已在模型里（strength=%.2f），跳过重复注入",
-                             lora_name, strength)
+                    log.info("[int4 Stack] ✓ 注入 %s | %dq+%db | strength=%.2f | 复用",
+                             lora_name, _q, _b, strength)
                     continue
-                log.info("[int4 Stack] %s 状态已丢失（去重记录仍在）→ 重新注入", lora_name)
+                log.debug("[int4 Stack] %s 状态已丢失 → 重新注入", lora_name)
             t0 = time.perf_counter()
             lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
             fmt = _auto_detect_format(lora_sd)
@@ -160,7 +161,8 @@ class INT4XPULoRAStack:
             if not hasattr(model.model, '_wa4_loras'):
                 object.__setattr__(model.model, '_wa4_loras', [])
             model.model._wa4_loras.append({"name": lora_name, "strength": strength,
-                                           "path": lora_path, "layers": aq + ab})
+                                           "path": lora_path, "layers": aq + ab,
+                                           "quant": aq, "bake": ab})
             del lora_sd, lora_data
 
         log.info("[int4 Stack] ✓ 共 %d 个 LoRA（%d 量化层 + %d bake 层）| %.2fs",

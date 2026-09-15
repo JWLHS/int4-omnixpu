@@ -25,9 +25,15 @@ from .int4_xpu_lora_common import (
 
 log = logging.getLogger("int4-LoRA")
 
-# 自动补回（卸载重放）进行中时的统计容器：重放期间每 LoRA 的注入明细降到
-# DEBUG，只在结束时打一条汇总；正常节点注入时该值为 None。
-_WA4_REPLAY_CTX = None
+
+def _wa4_parts(q, b):
+    """日志里的层数描述：224 quant + 32 bake / 0 layers。"""
+    if not q and not b:
+        return "0 layers"
+    out = []
+    if q: out.append(f"{q} quant")
+    if b: out.append(f"{b} bake")
+    return " + ".join(out)
 
 
 def _resolve_qkv_slices(index, norm):
@@ -232,18 +238,17 @@ class INT4XPULoRALoader:
             and abs(float(x.get("strength", 1.0)) - float(strength)) < 1e-5
         ), None)
         if _rec is not None:
+            _q = int(_rec.get("quant") or 0)
+            _b = int(_rec.get("bake") or 0)
             if _rec.get("layers") == 0:
-                # 上一次就 0 层匹配（LoRA 不属于这个模型）→ 不必每次重读文件重试
-                if _WA4_REPLAY_CTX is None:
-                    log.info("[int4 LoRA] = %s 上次匹配 0 层（模型里没有对应层），跳过重复尝试",
-                             lora_name)
+                log.debug("[int4 LoRA] %s 与当前模型不匹配（0 层），跳过", lora_name)
                 return (model,)
             if _wa4_lora_state_live(model, lora_name):
-                if _WA4_REPLAY_CTX is None:
-                    log.info("[int4 LoRA] = %s 已在模型里（strength=%.2f），跳过重复注入",
-                             lora_name, strength)
+                # 与直接注入同形：只是不重复做一遍
+                log.info("[int4 LoRA] ✓ 注入 %s | %s | strength=%s | 复用",
+                         lora_name, _wa4_parts(_q, _b), strength)
                 return (model,)
-            log.info("[int4 LoRA] %s 状态已丢失（去重记录仍在）→ 重新注入", lora_name)
+            log.debug("[int4 LoRA] %s 状态已丢失 → 重新注入", lora_name)
 
         base_model = model.model
         while hasattr(base_model, '_orig_mod'): base_model = base_model._orig_mod
@@ -334,24 +339,15 @@ class INT4XPULoRALoader:
             if not layer_matched: unmatched += 1
 
         elapsed = time.perf_counter() - t0
-        parts = []
-        if aq: parts.append(f"{aq} quant")
-        if ab: parts.append(f"{ab} bake")
-        if aq == 0 and ab == 0: parts = ["0 layers"]
-        if _WA4_REPLAY_CTX is None:
-            log.info("[int4 LoRA] ✓ 注入 %s | %s | strength=%s | %.2fs%s",
-                     lora_name, " + ".join(parts), strength, elapsed,
-                     f" | {unmatched} unmatched" if unmatched else "")
-        else:
-            _WA4_REPLAY_CTX["q"] += aq
-            _WA4_REPLAY_CTX["b"] += ab
-            log.debug("[int4 LoRA] （模型重新加载）注入 %s | %s | strength=%s | %.2fs",
-                      lora_name, " + ".join(parts), strength, elapsed)
+        log.info("[int4 LoRA] ✓ 注入 %s | %s | strength=%s | %.2fs%s",
+                 lora_name, _wa4_parts(aq, ab), strength, elapsed,
+                 f" | {unmatched} unmatched" if unmatched else "")
 
         if not hasattr(model.model, '_wa4_loras'):
             object.__setattr__(model.model, '_wa4_loras', [])
         model.model._wa4_loras.append({"name": lora_name, "strength": strength,
-                                       "path": lora_path, "layers": aq + ab})
+                                       "path": lora_path, "layers": aq + ab,
+                                       "quant": aq, "bake": ab})
         del lora_sd, lora_data
         return (model,)
 
@@ -420,11 +416,8 @@ class INT4XPULoRALoader:
         keep = [x for x in prev
                 if not (isinstance(x, dict) and x.get("name") == lora_name)]
         object.__setattr__(model.model, '_wa4_loras', keep)
-        if nq or nb or len(keep) != len(prev):
-            log.info("[int4 LoRA] ✗ 移除 %s（strength=0）：清理 %d 个量化层条目 + %d 个 bake 层",
-                     lora_name, nq, nb)
-        else:
-            log.debug("[int4 LoRA] %s 本来就不在模型里（strength=0，空操作）", lora_name)
+        log.info("[int4 LoRA] ✗ 未使用 %s（strength=0）", lora_name)
+        log.debug("[int4 LoRA] 已清理 %d 个量化层条目 + %d 个 bake 层", nq, nb)
 
     def _inject_standard(self, module, lora_name, down, up, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False):
         # █ 原样保留 █
@@ -540,31 +533,22 @@ def _wa4_lora_replay_apply(model, specs):
     重读文件约 0.1~0.2s/LoRA。每 LoRA 的注入明细降到 DEBUG，结束时只打一条
     可读汇总（量化层数 / bake 层数 / 耗时 / 是否重启预热）。
     """
-    global _WA4_REPLAY_CTX
-    from .int4_xpu_loader import _wa4_arm_prewarm, _wa4_lora_short_names
-    ctx = {"q": 0, "b": 0}
-    _WA4_REPLAY_CTX = ctx
+    from .int4_xpu_loader import _wa4_arm_prewarm
     t0 = time.perf_counter()
     names, n_bake, armed = [], 0, False
-    try:
-        loader = INT4XPULoRALoader()
-        for name, strength in specs:
-            try:
-                loader.load_lora(model, name, strength)
-                names.append(name)
-            except Exception as e:
-                log.warning("[int4 LoRA] 自动补回 %s 失败：%s", name, e)
-        n_bake = _wa4_lora_replay_flush_bakes(model)
-        armed = _wa4_arm_prewarm(model)
-    finally:
-        _WA4_REPLAY_CTX = None
+    loader = INT4XPULoRALoader()
+    for name, strength in specs:
+        try:
+            loader.load_lora(model, name, strength)
+            names.append(name)
+        except Exception as e:
+            log.warning("[int4 LoRA] %s 注入失败：%s", name, e)
+    n_bake = _wa4_lora_replay_flush_bakes(model)
+    armed = _wa4_arm_prewarm(model)
     if names:
-        log.info(
-            "[int4 LoRA] 模型重新加载：重新应用 %d 个 LoRA"
-            "（%d 量化层 + %d bake 层，%.2fs%s）：%s",
-            len(names), ctx["q"], n_bake,
-            "，权重已重新预加载" if armed else "", time.perf_counter() - t0,
-            _wa4_lora_short_names(names))
+        log.debug("[int4 LoRA] %d 个 LoRA 已恢复（bake %d 层%s，%.2fs）",
+                  len(names), n_bake, "，预热已重启" if armed else "",
+                  time.perf_counter() - t0)
 
 
 def _wa4_lora_replay_flush_bakes(model):

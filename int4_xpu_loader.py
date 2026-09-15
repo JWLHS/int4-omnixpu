@@ -312,8 +312,8 @@ def _wa4_lora_replay_schedule(model, specs, layers):
         "prompt": _wa4_prompt_id(),
     }
     _wa4_lora_replay_reindex()
-    log.info("[int4 LoRA] 模型卸载：清除 LoRA 状态（%d 个：%s）｜模型重新加载时会自动应用",
-             len(specs), _wa4_lora_short_names(specs))
+    log.debug("[int4 LoRA] 模型卸载：清除 LoRA 状态（%d 个：%s）｜模型重新加载时会自动应用",
+              len(specs), _wa4_lora_short_names(specs))
 
 
 def _wa4_lora_short_names(specs):
@@ -1103,7 +1103,7 @@ class INT4XPULinear(nn.Module):
         INT4XPULinear._prewarm_done = True
         target = INT4XPULinear._prewarm_target
         if target is None:
-            log.info("[int4] 权重加载：跳过批量预加载（将按需搬入显存）")
+            log.debug("[int4] 权重加载：跳过批量预加载（将按需搬入显存）")
             return
         _t0 = time.perf_counter()
         _n = 0
@@ -1114,8 +1114,8 @@ class INT4XPULinear(nn.Module):
                     _n += 1
                 except Exception:
                     pass
-        log.info("[int4] 权重加载：%d 层 → %s（%.2fs）",
-                 _n, dev, time.perf_counter() - _t0)
+        log.debug("[int4] 权重加载：%d 层 → %s（%.2fs）",
+                  _n, dev, time.perf_counter() - _t0)
 
     def _prepare(self):
         if self._prepared:
