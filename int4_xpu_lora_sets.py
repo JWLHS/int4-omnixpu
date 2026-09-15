@@ -26,7 +26,6 @@ SPEC_KEY = "wa4_lora"
 
 _SETS = {}          # token -> {"specs": [...], "ref": weakref(patcher)}
 _SEQ = 0
-_PARSE_CACHE = {}   # (path, mtime, size) -> 已解析的 LoRA（注入层格式）
 _ACTIVE = {"patcher": None}   # 当前这次采样用的是哪一路 patcher（由 prepare_sampling 记录）
 
 
@@ -94,21 +93,13 @@ def register(parent_patcher, child_patcher, new_specs):
 # ── 解析缓存（替代旧的 0 层负缓存）────────────────────────────────────
 
 def parse_lora(path):
-    """按 (路径, mtime, size) 缓存已解析的 LoRA，避免重复读文件。"""
-    try:
-        st = os.stat(path)
-        key = (path, st.st_mtime_ns, st.st_size)
-    except Exception:
-        key = (path, 0, 0)
-    hit = _PARSE_CACHE.get(key)
-    if hit is not None:
-        return hit
+    """读并解析 LoRA 文件（不缓存：A/B 张量可能上 GB，缓存会长期占内存）。
+
+    新架构下"规格不变就不重新注入"，所以解析只在真正需要注入时发生一次；
+    卸载后重建多花 0.1~0.2s 读文件，远小于缓存带来的内存风险。
+    """
     from .int4_xpu_lora_loader import parse_lora_file
-    data = parse_lora_file(path)
-    if len(_PARSE_CACHE) > 32:
-        _PARSE_CACHE.clear()
-    _PARSE_CACHE[key] = data
-    return data
+    return parse_lora_file(path)
 
 
 # ── 已应用状态（挂在 base model 上）──────────────────────────────────
