@@ -345,7 +345,7 @@ class INT4XPULoRALoader:
         else:
             _WA4_REPLAY_CTX["q"] += aq
             _WA4_REPLAY_CTX["b"] += ab
-            log.debug("[int4 LoRA] （自动补回）注入 %s | %s | strength=%s | %.2fs",
+            log.debug("[int4 LoRA] （模型重新加载）注入 %s | %s | strength=%s | %.2fs",
                       lora_name, " + ".join(parts), strength, elapsed)
 
         if not hasattr(model.model, '_wa4_loras'):
@@ -560,10 +560,10 @@ def _wa4_lora_replay_apply(model, specs):
         _WA4_REPLAY_CTX = None
     if names:
         log.info(
-            "[int4 LoRA] 模型重新运行：自动重新注入 %d 个 LoRA"
-            "（量化层 %d、bake 层 %d 已换权%s，%.2fs）：%s",
+            "[int4 LoRA] 模型重新加载：重新应用 %d 个 LoRA"
+            "（%d 量化层 + %d bake 层，%.2fs%s）：%s",
             len(names), ctx["q"], n_bake,
-            "，预热已重启" if armed else "", time.perf_counter() - t0,
+            "，权重已重新预加载" if armed else "", time.perf_counter() - t0,
             _wa4_lora_short_names(names))
 
 

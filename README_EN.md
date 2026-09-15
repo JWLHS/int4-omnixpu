@@ -259,6 +259,9 @@ then **our local test settings (reference only)** and why:
   entries and baked layers were rolled back. Message wording unified:
   `✓ 注入` / `= 已在模型里，跳过` / `✗ 移除` / `模型卸载：N 个 LoRA 随权重一起失效`
   / `模型重新运行：自动重新注入 N 个 LoRA`.
+  (Wording later simplified to plain load/unload events: `模型卸载：清除 LoRA 状态
+  （N 个：…）｜模型重新加载时会自动应用` / `模型重新加载：重新应用 N 个 LoRA
+  （X 量化层 + Y bake 层，t s…）` / `权重加载：N 层 → xpu:0（t s）`.)
 - 2026-09-15: Fix "second sampling in the same run loses the LoRA". Unloading a
   model (AIMDO VRAM reclaim, node-boundary trim, manual free — this happens
   between the two sampling stages of a two-pass workflow) clears the LoRA state,
