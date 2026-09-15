@@ -14,13 +14,13 @@ v3.0: pre-hook bake (deferred GPU compute, no CPU stall).
 import time, logging
 import torch, torch.nn as nn, re
 import folder_paths, comfy.utils
-from .int4_xpu_loader import (
-    _is_quant_linear, _wa4_lora_replay_tick, _wa4_lora_replay_drop,
-)
+from . import int4_xpu_lora_sets as int4_lora_sets
+from .int4_xpu_loader import _is_quant_linear
 from .int4_xpu_lora_common import (
-    _wa4_reset_all_loras, _auto_detect_format, _convert_bfl_to_standard,
+    _wa4_reset_all_loras,
+    _auto_detect_format, _convert_bfl_to_standard,
     _parse_raw_lora_sd, _get_accelerator_device, _rot_quarot_tensor,
-    _resolve_with_alias, _wa4_lora_state_live,
+    _resolve_with_alias,
 )
 
 log = logging.getLogger("int4-LoRA")
@@ -60,8 +60,6 @@ def _resolve_qkv_slices(index, norm):
 
 def _make_bake_pre_hook(module: nn.Module):
     def _pre_hook(_mod, _inputs):
-        # 卸载重放要先跑：本层的 bake 条目可能正是重放刚装进来的
-        _wa4_lora_replay_tick(module)
         bs = getattr(module, '_wa4_bake_state', None)
         if bs is None: return
         pending = bs.get('_pending')
@@ -188,67 +186,22 @@ def _make_bake_pre_hook(module: nn.Module):
     return _pre_hook
 
 
-class INT4XPULoRALoader:
-    NAME = "INT4XPU LoRA Loader"
-    CATEGORY = "int4"
+class _Wa4LoraWorker:
+    """LoRA 注入的干活的：把一份 LoRA 应用到模型上 / 从模型上移除。
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL", {"tooltip": "From int4XPUModelLoader"}),
-                "lora_name": (folder_paths.get_filename_list("loras"),),
-                "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
-            },
-        }
+    不持有状态，不写日志结论（日志由 int4_xpu_lora_sets 按"采样阶段"统一打）。
+    """
 
-    @classmethod
-    def IS_CHANGED(cls, model, lora_name, strength):
-        # █ 原样保留（缓存触发逻辑，不动）█
-        import random
-        return (lora_name, strength, random.random())
+    def apply_lora(self, model, lora_name, strength, entry_key=None):
+        """把 lora_name 按 strength 注入模型；返回 {quant, bake, unmatched}。
 
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "load_lora"
-
-    def load_lora(self, model, lora_name, strength):
-        # 节点执行 = 本次运行的真实意图：先丢弃卸载前登记的重放，避免旧 LoRA
-        # 在新的一次运行里被自动装回
-        _wa4_lora_replay_drop(model)
-        if getattr(model.model, '_wa4_lora_needs_reset', False):
-            _wa4_reset_all_loras(model)
-            object.__setattr__(model.model, '_wa4_lora_needs_reset', False)
-        if abs(strength) < 1e-5:
-            self._remove_lora(model, lora_name)
-            return (model,)
-
+        entry_key：条目/记账用的唯一键（同一个 LoRA 在链里出现多次时区分各份），
+        默认就是 lora_name。文件查找始终用 lora_name。
+        """
+        key = entry_key or lora_name
         lora_path = folder_paths.get_full_path("loras", lora_name)
         if lora_path is None:
             raise FileNotFoundError(f"[int4 LoRA] '{lora_name}' not found")
-
-        # 同 LoRA 同强度已注入 → 直接跳过（避免每轮重建 entries + GPU 缓存，
-        # 实测每轮重注入会让 XPU 分配器碎片化、显存逐轮 +~250MB）
-        _prev = getattr(model.model, "_wa4_loras", None) or []
-        _rec = next((
-            x for x in _prev
-            if isinstance(x, dict)
-            and x.get("name") == lora_name
-            and x.get("path") == lora_path
-            and abs(float(x.get("strength", 1.0)) - float(strength)) < 1e-5
-        ), None)
-        if _rec is not None:
-            _q = int(_rec.get("quant") or 0)
-            _b = int(_rec.get("bake") or 0)
-            if _rec.get("layers") == 0:
-                log.debug("[int4 LoRA] %s 与当前模型不匹配（0 层），跳过", lora_name)
-                return (model,)
-            if _wa4_lora_state_live(model, lora_name):
-                # 与直接注入同形：只是不重复做一遍
-                log.info("[int4 LoRA] ✓ 注入 %s | %s | strength=%s | 复用",
-                         lora_name, _wa4_parts(_q, _b), strength)
-                return (model,)
-            log.debug("[int4 LoRA] %s 状态已丢失 → 重新注入", lora_name)
 
         base_model = model.model
         while hasattr(base_model, '_orig_mod'): base_model = base_model._orig_mod
@@ -264,20 +217,7 @@ class INT4XPULoRALoader:
             H = build_hadamard(group_size, device="cpu", dtype=torch.float32)
 
         t0 = time.perf_counter()
-        lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
-        fmt = _auto_detect_format(lora_sd)
-        if fmt == "bfl": lora_sd = _convert_bfl_to_standard(lora_sd)
-        lora_data = _parse_raw_lora_sd(lora_sd)
-
-        if not getattr(model.model, '_wa4_detach_patched', False):
-            # █ 原样保留（detach 清缓存逻辑，不动）█
-            _orig_detach = model.detach
-            def _wa4_detach(unpatch_all=True):
-                _wa4_reset_all_loras(model, schedule_reapply=True)
-                object.__setattr__(model.model, '_wa4_lora_needs_reset', True)
-                return _orig_detach(unpatch_all)
-            object.__setattr__(model, 'detach', _wa4_detach)
-            object.__setattr__(model.model, '_wa4_detach_patched', True)
+        lora_data = int4_lora_sets.parse_lora(lora_path)
 
         aq, ab, unmatched = 0, 0, 0
         for norm, info in lora_data.items():
@@ -328,28 +268,22 @@ class INT4XPULoRALoader:
                     if lora_type == "lokr":
                         w1 = info.get("lokr_w1"); w2 = info.get("lokr_w2")
                         if w1 is None or w2 is None: continue
-                        self._inject_lokr(module, lora_name, w1, w2, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant)
+                        self._inject_lokr(module, key, w1, w2, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant)
                     else:
                         down = info.get("down"); up = info.get("up")
                         if down is None or up is None: continue
-                        self._inject_standard(module, lora_name, down, up, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant)
+                        self._inject_standard(module, key, down, up, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant)
                     if is_quant: aq += 1
                     else: ab += 1
                     layer_matched = True
             if not layer_matched: unmatched += 1
 
         elapsed = time.perf_counter() - t0
-        log.info("[int4 LoRA] ✓ 注入 %s | %s | strength=%s | %.2fs%s",
-                 lora_name, _wa4_parts(aq, ab), strength, elapsed,
-                 f" | {unmatched} unmatched" if unmatched else "")
-
-        if not hasattr(model.model, '_wa4_loras'):
-            object.__setattr__(model.model, '_wa4_loras', [])
-        model.model._wa4_loras.append({"name": lora_name, "strength": strength,
-                                       "path": lora_path, "layers": aq + ab,
-                                       "quant": aq, "bake": ab})
-        del lora_sd, lora_data
-        return (model,)
+        log.debug("[int4 LoRA] 注入完成 %s | %s | strength=%s | %.2fs%s",
+                  lora_name, _wa4_parts(aq, ab), strength, elapsed,
+                  f" | {unmatched} unmatched" if unmatched else "")
+        del lora_data
+        return {"quant": aq, "bake": ab, "unmatched": unmatched}
 
     @staticmethod
     def _pop_module_lora(module, lora_name):
@@ -401,23 +335,15 @@ class INT4XPULoRALoader:
             bs.clear()
         return had_q, had_b
 
-    def _remove_lora(self, model, lora_name):
-        # █ 原样保留 █
-        # 额外 1：同步撤掉去重记录，否则再次加载同名 LoRA 会被误判为"已注入"。
-        # 额外 2：把实际清掉的东西打进日志（以前这条路径完全没有痕迹，
-        # 出问题时无法从日志判断 strength=0 到底有没有生效）。
+    def remove_lora(self, model, lora_name):
+        """把该 LoRA 从模型上彻底移除（只动它自己的条目与 baked delta）。"""
         bm = model.model
         while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
         nq = nb = 0
         for m in bm.modules():
             q, b = self._pop_module_lora(m, lora_name)
             nq += q; nb += b
-        prev = getattr(model.model, '_wa4_loras', None) or []
-        keep = [x for x in prev
-                if not (isinstance(x, dict) and x.get("name") == lora_name)]
-        object.__setattr__(model.model, '_wa4_loras', keep)
-        log.info("[int4 LoRA] ✗ 未使用 %s（strength=0）", lora_name)
-        log.debug("[int4 LoRA] 已清理 %d 个量化层条目 + %d 个 bake 层", nq, nb)
+        log.debug("[int4 LoRA] 移除 %s：%d 个量化层条目 + %d 个 bake 层", lora_name, nq, nb)
 
     def _inject_standard(self, module, lora_name, down, up, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False):
         # █ 原样保留 █
@@ -526,55 +452,87 @@ class INT4XPULoRALoader:
                 le.setdefault(lora_name, []).append(("delta", delta, strength))
 
 
-def _wa4_lora_replay_apply(model, specs):
-    """模型卸载清空 LoRA 后，在模型重新运行时自动补回（仅同一次运行内）。
+_WORKER = _Wa4LoraWorker()
 
-    走与节点完全相同的注入路径（含去重记录写入），状态与"节点刚执行过"等价；
-    重读文件约 0.1~0.2s/LoRA。每 LoRA 的注入明细降到 DEBUG，结束时只打一条
-    可读汇总（量化层数 / bake 层数 / 耗时 / 是否重启预热）。
+
+def parse_lora_file(path):
+    """读 LoRA 文件 → {层路径: {type, down/up/alpha 或 lokr_w1/w2}}（由规格层缓存）。"""
+    lora_sd = comfy.utils.load_torch_file(path, safe_load=True)
+    fmt = _auto_detect_format(lora_sd)
+    if fmt == "bfl":
+        lora_sd = _convert_bfl_to_standard(lora_sd)
+    return _parse_raw_lora_sd(lora_sd)
+
+
+def apply_lora(model, lora_name, strength, entry_key=None):
+    return _WORKER.apply_lora(model, lora_name, strength, entry_key=entry_key)
+
+
+def remove_lora(model, lora_name):
+    return _WORKER.remove_lora(model, lora_name)
+
+
+def install_detach(model):
+    """卸载包装：清空 LoRA 状态（回滚 bake）+ 标记失效；下次采样按活跃规格重建。
+
+    幂等标志挂在 **patcher 实例** 上 —— 节点 clone 后每个分支各装一份。
     """
-    from .int4_xpu_loader import _wa4_arm_prewarm
-    t0 = time.perf_counter()
-    names, n_bake, armed = [], 0, False
-    loader = INT4XPULoRALoader()
-    for name, strength in specs:
+    if getattr(model, "_wa4_lora_detach_patched", False):
+        return
+    _orig_detach = model.detach
+
+    def _wa4_detach(unpatch_all=True):
         try:
-            loader.load_lora(model, name, strength)
-            names.append(name)
+            from .int4_xpu_loader import _wa4_release_model
+            _wa4_release_model(model)
         except Exception as e:
-            log.warning("[int4 LoRA] %s 注入失败：%s", name, e)
-    n_bake = _wa4_lora_replay_flush_bakes(model)
-    armed = _wa4_arm_prewarm(model)
-    if names:
-        log.debug("[int4 LoRA] %d 个 LoRA 已恢复（bake %d 层%s，%.2fs）",
-                  len(names), n_bake, "，预热已重启" if armed else "",
-                  time.perf_counter() - t0)
+            log.debug("[int4 LoRA] 显存释放失败：%s", e)
+        try:
+            _wa4_reset_all_loras(model)
+            int4_lora_sets.mark_dirty(model)
+        except Exception as e:
+            log.debug("[int4 LoRA] 卸载清理失败：%s", e)
+        return _orig_detach(unpatch_all)
+
+    object.__setattr__(model, 'detach', _wa4_detach)
+    object.__setattr__(model, '_wa4_lora_detach_patched', True)
 
 
-def _wa4_lora_replay_flush_bakes(model):
-    """把重放刚排队的 baked delta 立即落盘到权重。
+class INT4XPULoRALoader:
+    """薄壳节点：只记录"这一路要哪些 LoRA"，实际应用在采样时按活跃规格对齐。
 
-    正常路径下 bake 由各层 forward pre-hook 在"该层首次前向"时执行；重放发生
-    在某层前向内部，早于首个 int4 层的 baked 层已经跑过本步前向，会漏掉首个
-    step 的 delta（实测图像残差 mean≈0.7/255）。这里在重放结束时统一立即执行，
-    使重放结果与"节点刚执行过"完全一致。返回实际换权的层数（调用方负责日志）。
+    与原生 LoRA 节点同语义：`model.clone()` 后再追加规格 —— chained 节点叠加、
+    并联分支各自独立、绕过节点等于不在链里。
     """
-    bm = model.model
-    while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
-    n = 0
-    for m in bm.modules():
-        bs = getattr(m, '_wa4_bake_state', None)
-        if not bs or not bs.get('_pending'):
-            continue
-        fn = bs.get('_bake_now')
-        if fn is None:
-            continue
-        try:
-            fn(m, None)
-            n += 1
-        except Exception as e:
-            log.warning("[int4 LoRA] 重放 bake 立即执行失败（将由 pre-hook 兜底）：%s", e)
-    return n
+
+    NAME = "INT4XPU LoRA Loader"
+    CATEGORY = "int4"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "From int4XPUModelLoader"}),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "load_lora"
+    DESCRIPTION = "在模型上叠加一个 LoRA（采样时应用，语义与原生 LoRA 节点一致）。"
+
+    def load_lora(self, model, lora_name, strength):
+        parent = model
+        model = model.clone()
+        install_detach(model)
+        if abs(strength) < 1e-5:
+            log.info("[int4 LoRA] ✗ 未使用 %s（strength=0）", lora_name)
+            return (model,)
+        int4_lora_sets.register(parent, model, [
+            {"name": lora_name, "strength": float(strength), "kind": "loader"}])
+        return (model,)
 
 
 NODE_CLASS_MAPPINGS = {"INT4XPULoRALoader": INT4XPULoRALoader}

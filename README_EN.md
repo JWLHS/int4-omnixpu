@@ -250,6 +250,21 @@ then **our local test settings (reference only)** and why:
 
 ## Changelog
 
+- 2026-09-15 (LoRA now follows native semantics): LoRA no longer mutates the shared
+  model in place — it follows the ModelPatcher. Nodes only register their spec
+  (`model.clone()` + a token in that branch's `model_options["transformer_options"]`);
+  at sampling time the active branch's spec is read and the model's LoRA state is
+  reconciled to it (no spec change → zero work). Result: "pass 1 uses group A, pass 2
+  uses group B" works automatically, parallel branches no longer contaminate each
+  other, bypassed/deleted nodes simply are not in the chain, and chained nodes stack.
+  Five workarounds that only existed for the old architecture were removed: duplicate
+  injection skip, liveness check, 0-layer negative cache, unload spec capture + replay,
+  and the random `IS_CHANGED`. Verified: parallel group switch (pass 2 vs "B only":
+  pixel-identical, mean=0.000), chained A+B, LoRA Stack == chained, z-image fused qkv
+  (mean=47.3/94.8%), AIMDO and non-AIMDO paths, and three consecutive runs with flat
+  VRAM peaks (6521→6578→6578MB). Logs now report one block per sampling stage
+  (`✓ 注入 … | 224 quant + 32 bake | strength=… | 0.17s`, `| 复用`, `✓ 本次采样：无 LoRA`);
+  process details are debug-only.
 - 2026-09-15: LoRA logging + unload/reload path cleanup — (1) the automatic
   re-injection now re-arms the weight prewarm (same as the load path: bulk move
   on the next forward, a no-op for layers already resident) instead of falling

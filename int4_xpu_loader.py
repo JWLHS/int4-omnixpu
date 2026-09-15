@@ -155,7 +155,6 @@ class Int4LinearPython(nn.Module):
 
     def forward(self, x):
         global _TAO_ERR_PRINTED
-        _wa4_lora_replay_tick(self)
         dev = x.device
         x2 = x.reshape(-1, x.shape[-1]).to(self._act_dtype)
         if self._use_quarot and self._hadamard_H is not None:
@@ -198,7 +197,6 @@ class Int4LinearTorchao(nn.Module):
         object.__setattr__(self, "_wa4_lora_gpu", None)
 
     def forward(self, x):
-        _wa4_lora_replay_tick(self)
         dev = x.device
         x2 = x.reshape(-1, x.shape[-1])
         if self._use_quarot and self._hadamard_H is not None:
@@ -266,67 +264,79 @@ def _lora_cache_fetch(module, entries, dev, cd):
 
 
 # ── LoRA 卸载重放（v1.1）──────────────────────────────────────────────
-# detach（模型卸载：AIMDO 显存回收 / 节点边界 trim / 手动释放）会清空 LoRA
-# 状态，而 ComfyUI 里已经执行过的 LoRA 节点不会重跑 —— 于是"同一次运行内的
-# 第二次采样"会静默失去 LoRA（Krea2 int8 双采实测：卸载后条目清零，日志无
-# 任何重新注入）。这里在清空时登记"卸载前应有的 LoRA"，模型下次前向时自动
-# 重放；登记只对同一次运行有效，进入新的一次运行（prompt id 变化）即丢弃，
-# 不会把上一次运行的 LoRA 带进新工作流。
-_WA4_LORA_REPLAY = {}            # id(base_model) -> {"ref","specs","layers","prompt"}
-_WA4_LORA_REPLAY_LAYERS = set()  # 层 id 快查表：前向热路径只做一次集合判断
-_WA4_LORA_REPLAY_RUNNING = False
+# ── LoRA 规格对齐（向原生语义靠拢）──────────────────────────────────
+# LoRA 集跟着 ModelPatcher 走（int4_xpu_lora_sets），采样每一步读一次活跃规格，
+# 把模型上的 LoRA 状态对齐过去（集合不变就什么都不做）。卸载只置"脏"，下次
+# 采样按活跃规格重建 —— 不再需要"抓规格 + 重放"。
 
 
-def _wa4_prompt_id():
-    """当前 prompt id（把重放限制在同一次运行内用）。"""
-    try:
-        from server import PromptServer
-        return getattr(PromptServer.instance, "last_prompt_id", None)
-    except Exception:
-        return None
+_WA4_LORA_SYNC_HOOKED = False
+_WA4_SYNC_PROBE = False
 
 
-def _wa4_lora_replay_reindex():
-    _WA4_LORA_REPLAY_LAYERS.clear()
-    for e in _WA4_LORA_REPLAY.values():
-        _WA4_LORA_REPLAY_LAYERS.update(e["layers"])
+def _wa4_install_lora_sync_hook(model=None):
+    """在 `comfy.model_base.BaseModel.apply_model` 上挂一层（全局只挂一次）。
 
+    采样每个降噪步都会调 `BaseModel.apply_model`，且此时 `self.current_patcher`
+    就是这一路的 ModelPatcher —— 正好是读"活跃 LoRA 规格"的地方。
 
-def _wa4_lora_replay_schedule(model, specs, layers):
-    """登记"卸载前应有的 LoRA"，供模型下次前向自动重放。"""
-    if not specs or not layers:
+    为什么挂类而不是实例：AIMDO / torch.compile 会造出动态委托模型（实例可能
+    换对象），实例级包装会漏。判定"是我们的模型"用 `_wa4_lora_index`（int4 加载
+    时写在 BaseModel 上、clone 共享），其它模型只多两次属性查询、零影响。
+    """
+    global _WA4_LORA_SYNC_HOOKED
+    if _WA4_LORA_SYNC_HOOKED:
         return
-    import weakref
     try:
-        ref = weakref.ref(model)
-    except TypeError:
-        return
-    # 顺手清掉已经被 GC 的旧登记，避免表无限增长
-    for k in [k for k, e in _WA4_LORA_REPLAY.items() if e["ref"]() is None]:
-        _WA4_LORA_REPLAY.pop(k, None)
-    bm = model.model
-    while hasattr(bm, '_orig_mod'):
-        bm = bm._orig_mod
-    _WA4_LORA_REPLAY[id(bm)] = {
-        "ref": ref, "specs": list(specs), "layers": set(layers),
-        "prompt": _wa4_prompt_id(),
-    }
-    _wa4_lora_replay_reindex()
-    log.debug("[int4 LoRA] 模型卸载：清除 LoRA 状态（%d 个：%s）｜模型重新加载时会自动应用",
-              len(specs), _wa4_lora_short_names(specs))
+        import comfy.model_base as _mb
+        _orig_apply = _mb.BaseModel.apply_model
 
+        def _wa4_apply_with_lora_sync(self, x, t=None, *args, **kwargs):
+            try:
+                # 判定"这是我们 int4 加载的模型"：索引写在 diffusion_model 上
+                dm = getattr(self, "diffusion_model", None)
+                while hasattr(dm, "_orig_mod"):
+                    dm = dm._orig_mod
+                _patch = getattr(self, "current_patcher", None)
+                from . import int4_xpu_lora_sets as _ls
+                _active = _ls.active_patcher()
+                if _active is not None:
+                    # prepare_sampling 记录的那一路才是"这次采样"的 patcher
+                    # （AIMDO 下模型不会为每个分支重新 patch，current_patcher 会滞后）
+                    _patch = _active
+                _ours = bool((getattr(_patch, "model_options", {}) or {}).get("wa4_int4")) or (
+                    dm is not None and getattr(dm, "_wa4_lora_index", None) is not None)
+                if _ours:
+                    from . import int4_xpu_lora_sets as lora_sets
+                    patcher = getattr(self, "current_patcher", None)
+                    if patcher is not None:
+                        specs = lora_sets.specs_of_options(kwargs.get("transformer_options"))
+                        if specs is None:
+                            specs = lora_sets.specs_of(patcher)
+                        lora_sets.sync(patcher, specs, timestep=t)
+            except Exception as e:
+                log.debug("[int4 LoRA] 规格对齐失败：%s", e)
+            return _orig_apply(self, x, t, *args, **kwargs)
 
-def _wa4_lora_short_names(specs):
-    """只留文件名（去掉目录和扩展名），用于日志可读性。"""
-    import os as _os
-    out = []
-    for spec in specs:
-        name = spec[0] if isinstance(spec, (tuple, list)) else spec
-        try:
-            out.append(_os.path.splitext(_os.path.basename(name))[0])
-        except Exception:
-            out.append(str(name))
-    return ", ".join(out)
+        _mb.BaseModel.apply_model = _wa4_apply_with_lora_sync
+
+        # prepare_sampling 每次采样都会带"确切那一路"的 ModelPatcher；
+        # 记下来给 apply_model 用（AIMDO 下 current_patcher 可能滞后于分支切换）。
+        import comfy.sampler_helpers as _sh
+        _orig_prepare = _sh.prepare_sampling
+
+        def _wa4_prepare_sampling(patcher, *a, **kw):
+            try:
+                from . import int4_xpu_lora_sets as lora_sets
+                lora_sets.set_active_patcher(patcher)
+            except Exception:
+                pass
+            return _orig_prepare(patcher, *a, **kw)
+
+        _sh.prepare_sampling = _wa4_prepare_sampling
+        _WA4_LORA_SYNC_HOOKED = True
+    except Exception as e:
+        log.debug("[int4 LoRA] 对齐钩子安装失败：%s", e)
 
 
 def _wa4_arm_prewarm(model):
@@ -358,57 +368,45 @@ def _wa4_arm_prewarm(model):
         return False
 
 
-def _wa4_lora_replay_drop(model):
-    """节点执行（= 本次运行的真实意图）后丢弃该模型的重放登记。"""
-    bm = getattr(model, "model", None)
-    if bm is None:
-        return
-    while hasattr(bm, '_orig_mod'):
-        bm = bm._orig_mod
-    if _WA4_LORA_REPLAY.pop(id(bm), None) is not None:
-        _wa4_lora_replay_reindex()
+def _wa4_release_model(model):
+    """模型卸载时的显存处理（语义与旧版 detach 包装一致）。
 
-
-def _wa4_lora_replay_tick(module):
-    """前向热路径调用：没有待重放时只是一次空集合判断。"""
-    if not _WA4_LORA_REPLAY_LAYERS:
-        return
-    if id(module) not in _WA4_LORA_REPLAY_LAYERS:
-        return
-    _wa4_lora_replay_run(module)
-
-
-def _wa4_lora_replay_run(module):
-    global _WA4_LORA_REPLAY_RUNNING
-    if _WA4_LORA_REPLAY_RUNNING:
-        return
-    key = None
-    for k, e in _WA4_LORA_REPLAY.items():
-        if id(module) in e["layers"]:
-            key = k
-            break
-    if key is None:
-        _wa4_lora_replay_reindex()
-        return
-    entry = _WA4_LORA_REPLAY.pop(key, None)
-    _wa4_lora_replay_reindex()
-    if entry is None:
-        return
-    model = entry["ref"]()
-    if model is None:
-        return
-    cur = _wa4_prompt_id()
-    if entry["prompt"] is not None and cur is not None and entry["prompt"] != cur:
-        log.debug("[int4 LoRA] 新一轮运行：上一轮的自动补回排队已取消")
-        return
-    _WA4_LORA_REPLAY_RUNNING = True
+    - 非 AIMDO 且非"同模型热重用"：释放每层 XPU 权重副本 + sync/empty_cache
+    - AIMDO 接管：让路，只清 LoRA 的 GPU 缓存
+    - 复位/清空 prewarm 目标（下次用时重新批量搬入）
+    """
+    force_release = False
+    auto_unload = False
     try:
-        from .int4_xpu_lora_loader import _wa4_lora_replay_apply
-        _wa4_lora_replay_apply(model, entry["specs"])
-    except Exception as e:
-        log.warning("[int4 LoRA] 卸载重放失败：%s", e)
-    finally:
-        _WA4_LORA_REPLAY_RUNNING = False
+        from .int4_xpu_cleanup import is_force_release_active, is_auto_unload_active
+        force_release = is_force_release_active()
+        auto_unload = is_auto_unload_active()
+    except Exception:
+        pass
+    keep_resident = (not force_release) and auto_unload
+    dm = model.model.diffusion_model
+    while hasattr(dm, '_orig_mod'):
+        dm = dm._orig_mod
+    for m in dm.modules():
+        try:
+            if isinstance(m, INT4XPULinear):
+                if not _aimdo_manages() and not keep_resident:
+                    m.release_xpu()
+                elif not keep_resident:
+                    object.__setattr__(m, "_wa4_lora_gpu", None)
+            elif isinstance(m, (Int4LinearPython, Int4LinearTorchao)):
+                if not keep_resident:
+                    object.__setattr__(m, "_wa4_lora_gpu", None)
+        except Exception:
+            pass
+    if keep_resident:
+        INT4XPULinear._prewarm_done = False
+    else:
+        INT4XPULinear._prewarm_target = None
+        INT4XPULinear._prewarm_done = False
+    if not _aimdo_manages() and not keep_resident:
+        torch.xpu.synchronize()
+        torch.xpu.empty_cache()
 
 
 def _apply_lokr_factor(x2, o, w1, w2, mult):
@@ -1186,7 +1184,6 @@ class INT4XPULinear(nn.Module):
             pass
 
     def forward(self, x):
-        _wa4_lora_replay_tick(self)
         INT4XPULinear._prewarm_once(getattr(x, "device", None))
         self._prepare()
         from omni_xpu_kernel import svdq
@@ -2049,6 +2046,14 @@ class int4XPUModelLoader:
             except Exception:
                 pass
 
+        # ── LoRA 规格对齐钩子：每个采样步读一次活跃规格，把模型上的 LoRA
+        # 状态对齐过去（集合不变 → 零开销）。挂钩 apply_model 而不是
+        # diffusion_model.forward：后者会被 TorchCompileModel 包进编译图。 ──
+        try:
+            _wa4_install_lora_sync_hook(model)
+        except Exception as e:
+            log.debug("[int4 LoRA] 对齐钩子安装失败：%s", e)
+
         # ── detach 包装：任何模型卸载时都释放 int4 层的 XPU 副本，并清掉
         # class 级强引用（_prewarm_target）。否则卸载后模型永远不会被 GC，
         # 打包权重一直驻留显存——只有同系列模型再次加载覆盖引用时才"自行
@@ -2057,44 +2062,18 @@ class int4XPUModelLoader:
         _o_detach = model.detach
         def _wa4_detach(unpatch_all=True):
             try:
-                force_release = False
-                auto_unload = False
-                try:
-                    from .int4_xpu_cleanup import is_force_release_active, is_auto_unload_active
-                    force_release = is_force_release_active()
-                    auto_unload = is_auto_unload_active()
-                except Exception:
-                    pass
-                keep_resident = (not force_release) and auto_unload
-                dm = model.model.diffusion_model
-                while hasattr(dm, '_orig_mod'):
-                    dm = dm._orig_mod
-                for m in dm.modules():
-                    try:
-                        if isinstance(m, INT4XPULinear):
-                            if not _aimdo_manages() and not keep_resident:
-                                m.release_xpu()
-                            elif not keep_resident:
-                                object.__setattr__(m, "_wa4_lora_gpu", None)
-                        elif isinstance(m, (Int4LinearPython, Int4LinearTorchao)):
-                            # 回退类无 release_xpu，只清 LoRA GPU 缓存
-                            if not keep_resident:
-                                object.__setattr__(m, "_wa4_lora_gpu", None)
-                    except Exception:
-                        pass
-                if keep_resident:
-                    # 自动卸载（同模型热重用）：权重常驻，仅复位 prewarm 状态
-                    INT4XPULinear._prewarm_done = False
-                else:
-                    INT4XPULinear._prewarm_target = None
-                    INT4XPULinear._prewarm_done = False
-                if not _aimdo_manages() and not keep_resident:
-                    torch.xpu.synchronize()
-                    torch.xpu.empty_cache()
+                _wa4_release_model(model)
             except Exception:
                 pass
             return _o_detach(unpatch_all)
         object.__setattr__(model, 'detach', _wa4_detach)
+
+        # 标记"这是 int4xpu 加载的模型"：写在 patcher 的 model_options 上，
+        # clone（含 AIMDO 动态委托）会深拷贝它 → 采样侧靠它判定要不要做 LoRA 对齐。
+        try:
+            model.model_options["wa4_int4"] = True
+        except Exception:
+            pass
 
         log.info("[int4] Load complete (dtype=%s, backend=%s)", act_dtype, backend)
         try:

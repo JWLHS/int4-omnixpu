@@ -184,24 +184,15 @@ def _parse_raw_lora_sd(lora_sd: dict) -> dict[str, dict]:
     return lora_data
 
 
-def _wa4_reset_all_loras(model, schedule_reapply: bool = False) -> None:
-    """Full reset: INT4XPULinear entries + bake-state rollback.
+def _wa4_reset_all_loras(model) -> None:
+    """清空模型上的全部 LoRA 状态：量化层条目 + bake 回滚。
 
-    schedule_reapply=True（模型卸载路径）：把当前 LoRA 期望状态登记给
-    int4_xpu_loader 的重放表 —— 同一次运行内模型被卸载后重新加载时，LoRA
-    节点已经执行过不会重跑，只能由模型下次前向自动装回（否则第二次采样
-    会静默失去 LoRA）。节点自身的 reset（schedule_reapply=False）不登记，
-    因为紧接着就会重新注入。
+    在模型卸载时调用（权重被释放/还原，LoRA 状态随之失效）；重建由
+    int4_xpu_lora_sets.sync() 在下次采样时按"活跃规格"完成。
     """
     bm = model.model
     while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
     cpu = torch.device("cpu")
-    specs, layers = [], []
-    if schedule_reapply:
-        for x in (getattr(model.model, "_wa4_loras", None) or []):
-            if isinstance(x, dict) and x.get("name") and x.get("layers") != 0:
-                # layers==0 的 LoRA 本来就没匹配到任何层，重放它没有意义
-                specs.append((x["name"], x.get("strength", 1.0)))
     touched = 0
     for m in bm.modules():
         if _is_quant_linear(m):
@@ -209,9 +200,6 @@ def _wa4_reset_all_loras(model, schedule_reapply: bool = False) -> None:
             if le:
                 touched += 1
                 object.__setattr__(m, '_wa4_lora_entries', None)
-            if schedule_reapply: layers.append(id(m))
-        elif schedule_reapply and isinstance(m, torch.nn.Linear):
-            layers.append(id(m))
         bs = getattr(m, '_wa4_bake_state', None)
         if bs is None: continue
         if bs.get('_applied') or bs.get('_pending'):
@@ -235,34 +223,4 @@ def _wa4_reset_all_loras(model, schedule_reapply: bool = False) -> None:
                 except Exception: pass
         bs.pop('_pending', None)
         bs.clear()
-    object.__setattr__(model.model, '_wa4_loras', [])
-    if specs and layers:
-        from .int4_xpu_loader import _wa4_lora_replay_schedule
-        _wa4_lora_replay_schedule(model, specs, layers)
-    elif touched:
-        # 节点入口的重置：多数情况下上一步（卸载/移除）已经清干净，这里无事
-        # 可做 → 完全静默，避免同一轮里重复刷同一句话。
-        log.debug("[int4 LoRA] 清理残留 LoRA 状态：%d 个模块", touched)
-
-
-def _wa4_lora_state_live(model, lora_name: str) -> bool:
-    """去重跳过前的存活校验。
-
-    只在"该 LoRA 的量化条目或 bake 记录确实还在模型上"时才允许跳过重复
-    注入；状态被清空（卸载、strength=0 移除等）而 `_wa4_loras` 记录还在时
-    必须重新注入，否则会静默失去 LoRA。
-    """
-    bm = model.model
-    while hasattr(bm, '_orig_mod'): bm = bm._orig_mod
-    for m in bm.modules():
-        le = getattr(m, '_wa4_lora_entries', None)
-        if le and lora_name in le:
-            return True
-        bs = getattr(m, '_wa4_bake_state', None)
-        if bs:
-            # bake 记账按 LoRA 名字分开：排队中（_pending）或已 baked（_applied）
-            for key in ('_pending', '_applied'):
-                d = bs.get(key)
-                if isinstance(d, dict) and lora_name in d:
-                    return True
-    return False
+    log.debug("[int4 LoRA] 已清空模型上的 LoRA 状态（%d 个模块）", touched)
