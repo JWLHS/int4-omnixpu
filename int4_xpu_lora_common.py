@@ -199,22 +199,32 @@ def _wa4_reset_all_loras(model, schedule_reapply: bool = False) -> None:
     specs, layers = [], []
     if schedule_reapply:
         for x in (getattr(model.model, "_wa4_loras", None) or []):
-            if isinstance(x, dict) and x.get("name"):
+            if isinstance(x, dict) and x.get("name") and x.get("layers") != 0:
+                # layers==0 的 LoRA 本来就没匹配到任何层，重放它没有意义
                 specs.append((x["name"], x.get("strength", 1.0)))
+    touched = 0
     for m in bm.modules():
         if _is_quant_linear(m):
-            object.__setattr__(m, '_wa4_lora_entries', None)
+            le = getattr(m, '_wa4_lora_entries', None)
+            if le:
+                touched += 1
+                object.__setattr__(m, '_wa4_lora_entries', None)
             if schedule_reapply: layers.append(id(m))
         elif schedule_reapply and isinstance(m, torch.nn.Linear):
             layers.append(id(m))
         bs = getattr(m, '_wa4_bake_state', None)
         if bs is None: continue
+        if bs.get('_applied') or bs.get('_pending'):
+            touched += 1
         hh = bs.pop('_hook_handle', None)
         if hh is not None:
             try: hh.remove()
             except Exception: pass
         applied = bs.pop('_applied', None)
-        if applied is not None and hasattr(m, 'weight') and m.weight is not None:
+        if isinstance(applied, dict):
+            # 新结构：{lora_name: [(delta, sl, se), ...]} → 整层全部回滚
+            applied = [e for _lst in applied.values() for e in _lst]
+        if applied and hasattr(m, 'weight') and m.weight is not None:
             for delta_cpu, sl, se in applied:
                 try:
                     neg = (-delta_cpu).to(device=m.weight.device, dtype=m.weight.dtype)
@@ -229,7 +239,10 @@ def _wa4_reset_all_loras(model, schedule_reapply: bool = False) -> None:
     if specs and layers:
         from .int4_xpu_loader import _wa4_lora_replay_schedule
         _wa4_lora_replay_schedule(model, specs, layers)
-    log.info("[int4 LoRA] All LoRA entries cleared")
+    elif touched:
+        # 节点入口的重置：多数情况下上一步（卸载/移除）已经清干净，这里无事
+        # 可做 → 完全静默，避免同一轮里重复刷同一句话。
+        log.debug("[int4 LoRA] 清理残留 LoRA 状态：%d 个模块", touched)
 
 
 def _wa4_lora_state_live(model, lora_name: str) -> bool:
@@ -246,6 +259,10 @@ def _wa4_lora_state_live(model, lora_name: str) -> bool:
         if le and lora_name in le:
             return True
         bs = getattr(m, '_wa4_bake_state', None)
-        if bs and lora_name in bs:
-            return True
+        if bs:
+            # bake 记账按 LoRA 名字分开：排队中（_pending）或已 baked（_applied）
+            for key in ('_pending', '_applied'):
+                d = bs.get(key)
+                if isinstance(d, dict) and lora_name in d:
+                    return True
     return False

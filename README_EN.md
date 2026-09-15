@@ -250,6 +250,15 @@ then **our local test settings (reference only)** and why:
 
 ## Changelog
 
+- 2026-09-15: LoRA logging + unload/reload path cleanup — (1) the automatic
+  re-injection now re-arms the weight prewarm (same as the load path: bulk move
+  on the next forward, a no-op for layers already resident) instead of falling
+  back to per-layer lazy transfers; (2) unload/clear no longer prints the same
+  line twice (the no-op node-side reset is silent, moved to debug); (3) a
+  `strength=0` removal left no trace in the log — it now reports how many quant
+  entries and baked layers were rolled back. Message wording unified:
+  `✓ 注入` / `= 已在模型里，跳过` / `✗ 移除` / `模型卸载：N 个 LoRA 随权重一起失效`
+  / `模型重新运行：自动重新注入 N 个 LoRA`.
 - 2026-09-15: Fix "second sampling in the same run loses the LoRA". Unloading a
   model (AIMDO VRAM reclaim, node-boundary trim, manual free — this happens
   between the two sampling stages of a two-pass workflow) clears the LoRA state,

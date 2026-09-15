@@ -312,8 +312,50 @@ def _wa4_lora_replay_schedule(model, specs, layers):
         "prompt": _wa4_prompt_id(),
     }
     _wa4_lora_replay_reindex()
-    log.info("[int4 LoRA] 卸载已清空 LoRA（%d 个）→ 登记重放，模型下次前向自动装回",
-             len(specs))
+    log.info("[int4 LoRA] 模型卸载：%d 个 LoRA 随权重一起失效（已排队，模型下次运行时自动重新注入）：%s",
+             len(specs), _wa4_lora_short_names(specs))
+
+
+def _wa4_lora_short_names(specs):
+    """只留文件名（去掉目录和扩展名），用于日志可读性。"""
+    import os as _os
+    out = []
+    for spec in specs:
+        name = spec[0] if isinstance(spec, (tuple, list)) else spec
+        try:
+            out.append(_os.path.splitext(_os.path.basename(name))[0])
+        except Exception:
+            out.append(str(name))
+    return ", ".join(out)
+
+
+def _wa4_arm_prewarm(model):
+    """重新武装权重预热（与 int4XPUModelLoader 加载路径完全一致）。
+
+    卸载会把 _prewarm_target 清成 None，重载后权重就退化成"每层首次前向才
+    零散搬一次"；LoRA 自动补回之后重新指向同一个 diffusion_model，让下次
+    前向照加载路径批量搬回（已在 XPU 上的层是空操作，不会重复搬）。
+
+    收紧条件（避免任何多余动作）：
+      - 只有"预热目标确实被卸载清空"（target is None）时才武装；已武装、
+        或已预热完成（权重常驻）时一律不动，不产生任何额外扫描/搬运。
+      - 失败只返回 False（退回原来的懒加载），不抛异常。
+      - 环境变量 OMNIXPU_INT4_REPLAY_PREWARM=0 可一键关闭本行为。
+    """
+    if os.environ.get("OMNIXPU_INT4_REPLAY_PREWARM", "1") == "0":
+        return False
+    if INT4XPULinear._prewarm_target is not None:
+        # 已经处于"等待批量预热"或"已预热"状态，不需要（也不应该）重来一次
+        return False
+    try:
+        dm = model.model.diffusion_model
+        while hasattr(dm, '_orig_mod'):
+            dm = dm._orig_mod
+        INT4XPULinear._prewarm_target = dm
+        INT4XPULinear._prewarm_done = False
+        return True
+    except Exception:
+        return False
 
 
 def _wa4_lora_replay_drop(model):
@@ -357,7 +399,7 @@ def _wa4_lora_replay_run(module):
         return
     cur = _wa4_prompt_id()
     if entry["prompt"] is not None and cur is not None and entry["prompt"] != cur:
-        log.info("[int4 LoRA] 已进入新的一次运行 → 丢弃上一次运行遗留的 LoRA 重放登记")
+        log.debug("[int4 LoRA] 新一轮运行：上一轮的自动补回排队已取消")
         return
     _WA4_LORA_REPLAY_RUNNING = True
     try:

@@ -60,7 +60,7 @@ class INT4XPULoRAStack:
             _wa4_reset_all_loras(model)
             object.__setattr__(model.model, '_wa4_lora_needs_reset', False)
         if not to_apply:
-            log.info("[int4 Stack] ✓ no active LoRAs")
+            log.info("[int4 Stack] = 没有启用的 LoRA（未填或强度 0），跳过")
             return (model,)
 
         base_model = model.model
@@ -92,18 +92,23 @@ class INT4XPULoRAStack:
 
         for lora_name, lora_path, strength in to_apply:
             # 同 LoRA 同强度已注入 → 跳过（避免每轮重建 entries + GPU 缓存碎片化）
-            _dup = any(
-                isinstance(x, dict)
+            _rec = next((
+                x for x in prev_applied
+                if isinstance(x, dict)
                 and x.get("name") == lora_name
                 and x.get("path") == lora_path
                 and abs(float(x.get("strength", 1.0)) - float(strength)) < 1e-5
-                for x in prev_applied
-            )
-            if _dup:
-                if _wa4_lora_state_live(model, lora_name):
-                    log.info("[int4 Stack] %s 已按 strength=%.2f 注入，跳过", lora_name, strength)
+            ), None)
+            if _rec is not None:
+                if _rec.get("layers") == 0:
+                    log.info("[int4 Stack] = %s 上次匹配 0 层（模型里没有对应层），跳过重复尝试",
+                             lora_name)
                     continue
-                log.info("[int4 Stack] %s 记录仍在但 LoRA 状态已被清空 → 重新注入", lora_name)
+                if _wa4_lora_state_live(model, lora_name):
+                    log.info("[int4 Stack] = %s 已在模型里（strength=%.2f），跳过重复注入",
+                             lora_name, strength)
+                    continue
+                log.info("[int4 Stack] %s 状态已丢失（去重记录仍在）→ 重新注入", lora_name)
             t0 = time.perf_counter()
             lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
             fmt = _auto_detect_format(lora_sd)
@@ -147,33 +152,48 @@ class INT4XPULoRAStack:
             parts = []
             if aq: parts.append(f"{aq}q")
             if ab: parts.append(f"{ab}b")
-            log.info("[int4 Stack] %s | %s | s=%.2f | %.2fs%s",
+            log.info("[int4 Stack] ✓ 注入 %s | %s | strength=%.2f | %.2fs%s",
                      lora_name, "+".join(parts) if parts else "0", strength, elapsed,
                      f" | {unmatched}u" if unmatched else "")
             total_aq += aq; total_ab += ab
 
             if not hasattr(model.model, '_wa4_loras'):
                 object.__setattr__(model.model, '_wa4_loras', [])
-            model.model._wa4_loras.append({"name": lora_name, "strength": strength, "path": lora_path})
+            model.model._wa4_loras.append({"name": lora_name, "strength": strength,
+                                           "path": lora_path, "layers": aq + ab})
             del lora_sd, lora_data
 
-        log.info("[int4 Stack] ✓ %d LoRAs | %dq+%db | %.2fs",
+        log.info("[int4 Stack] ✓ 共 %d 个 LoRA（%d 量化层 + %d bake 层）| %.2fs",
                  len(to_apply), total_aq, total_ab, time.perf_counter() - total_t0)
         return (model,)
 
     @staticmethod
     def _pop_module_lora(module, lora_name):
-        # █ 原样保留（baked delta 回滚，不动）█
+        # 与 loader 版一致：只移除本 LoRA 的量化条目与它自己的 baked delta，
+        # 同层其它 LoRA 的 delta/hook 保留；返回 (量化条目数, bake 层数)。
+        had_q = had_b = 0
         if _is_quant_linear(module):
             le = getattr(module, '_wa4_lora_entries', None)
             if le is not None:
-                le.pop(lora_name, None)
+                if le.pop(lora_name, None) is not None:
+                    had_q = 1
                 if len(le) == 0: object.__setattr__(module, '_wa4_lora_entries', None)
         bs = getattr(module, '_wa4_bake_state', None)
-        if bs is None: return
-        applied = bs.pop('_applied', None)
-        if applied is not None and hasattr(module, 'weight') and module.weight is not None:
-            for delta_cpu, sl, se in applied:
+        if bs is None: return had_q, had_b
+        pend = bs.get('_pending')
+        if isinstance(pend, dict):
+            if pend.pop(lora_name, None) is not None:
+                had_b = 1
+        app = bs.get('_applied')
+        deltas = None
+        if isinstance(app, dict):
+            deltas = app.pop(lora_name, None)
+        elif app:
+            deltas = app
+            app = None
+        if deltas and hasattr(module, 'weight') and module.weight is not None:
+            had_b = 1
+            for delta_cpu, sl, se in deltas:
                 try:
                     neg = (-delta_cpu).to(device=module.weight.device, dtype=module.weight.dtype)
                     if sl is not None and se is not None:
@@ -181,13 +201,17 @@ class INT4XPULoRAStack:
                     else:
                         module.weight.data.add_(neg)
                 except Exception: pass
-        bs.pop(lora_name, None)
-        bs.pop('_pending', None)
-        bs.pop('_bake_now', None)
-        hh = bs.pop('_hook_handle', None)
-        if hh is not None:
-            try: hh.remove()
-            except Exception: pass
+        if not pend and not app:
+            bs.pop(lora_name, None)
+            bs.pop('_pending', None)
+            bs.pop('_applied', None)
+            bs.pop('_bake_now', None)
+            hh = bs.pop('_hook_handle', None)
+            if hh is not None:
+                try: hh.remove()
+                except Exception: pass
+            bs.clear()
+        return had_q, had_b
 
     def _inject_standard(self, module, lora_name, down, up, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False):
         # █ 原样保留 █
@@ -200,11 +224,10 @@ class INT4XPULoRAStack:
             bs = getattr(module, '_wa4_bake_state', None)
             if bs is None: bs = {}; object.__setattr__(module, '_wa4_bake_state', bs)
             pending = bs.get('_pending')
-            if pending is None: pending = []; bs['_pending'] = pending
+            if not isinstance(pending, dict): pending = {}; bs['_pending'] = pending
             sl = qkv_slice[0] if qkv_slice else None
             se = qkv_slice[1] if qkv_slice else None
-            pending.append((A, B, mult, sl, se))
-            bs[lora_name] = True   # 存活标记（_wa4_lora_state_live / _pop_module_lora 用）
+            pending.setdefault(lora_name, []).append((A, B, mult, sl, se))
             if '_hook_handle' not in bs:
                 _bake_fn = _make_bake_pre_hook(module)
                 hook = module.register_forward_pre_hook(_bake_fn)
@@ -249,11 +272,10 @@ class INT4XPULoRAStack:
             bs = getattr(module, '_wa4_bake_state', None)
             if bs is None: bs = {}; object.__setattr__(module, '_wa4_bake_state', bs)
             pending = bs.get('_pending')
-            if pending is None: pending = []; bs['_pending'] = pending
+            if not isinstance(pending, dict): pending = {}; bs['_pending'] = pending
             sl = qkv_slice[0] if qkv_slice else None
             se = qkv_slice[1] if qkv_slice else None
-            pending.append(("delta", delta, strength, sl, se))
-            bs[lora_name] = True   # 存活标记（_wa4_lora_state_live / _pop_module_lora 用）
+            pending.setdefault(lora_name, []).append(("delta", delta, strength, sl, se))
             if '_hook_handle' not in bs:
                 _bake_fn = _make_bake_pre_hook(module)
                 hook = module.register_forward_pre_hook(_bake_fn)
