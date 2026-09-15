@@ -289,6 +289,21 @@ then **our local test settings (reference only)** and why:
   injection at the same strength" fast path now also verifies the LoRA state is
   still alive before skipping (this also fixes reloading a LoRA after a
   strength=0 removal).
+- 2026-09-16: Fix VRAM accumulation when switching models under AIMDO. The step
+  in `_wa4_release_model` that releases each layer's XPU weight copy used to be
+  skipped entirely while AIMDO was in charge (commented as "let AIMDO own it"),
+  on the assumption that AIMDO returns that device memory on model unload. It
+  does not: within one process, switching from the Krea2 tint4 packed file to
+  the Krea2 wa4 file grows device usage from 6421MB to 12600MB — a full extra
+  model — and a third model then OOMs and lands as `DEVICE_LOST`. Single-variable
+  control (same plugin / same kernel / same sequence, only toggling AIMDO):
+  on 6421→12600MB (+6179MB), off 7692→7800MB (+108MB), so the skipped step is
+  where the memory went. Model switch / explicit release now always reclaims the
+  per-layer copies (still no `sync`/`empty_cache` under AIMDO — only drop the
+  references and let the pool reuse them); prompt-end auto unload and same-model
+  warm start are byte-for-byte unchanged. Regression: three consecutive model
+  switches in one process 6421 / 6535 / 6464MB at 17.6 / 16.5 / 11.4s, and five
+  cases (including int8 and two-pass sampling) all pass on the main environment.
 - 2026-08-30: F2K (flux-2-klein-9b) quantization quality fix — the flux2
   quantizer exclusion list now keeps `img_attn.qkv/proj`, the last double
   block and the first/last single blocks at full precision (located by a
