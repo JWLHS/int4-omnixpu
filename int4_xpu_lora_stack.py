@@ -44,7 +44,8 @@ class INT4XPULoRAStack:
             if name is None or name == "None" or name == "":
                 continue
             if abs(float(strength)) < 1e-5:
-                log.info("[int4 Stack] ✗ 未使用 %s（strength=0）", name)
+                # 0 强度也登记规格：可撤掉链里前面同名的 LoRA（归零=撤销）
+                specs.append({"name": name, "strength": 0.0, "kind": "stack"})
                 continue
             if folder_paths.get_full_path("loras", name) is None:
                 log.warning("[int4 Stack] LoRA 不存在：%s", name)
@@ -57,4 +58,3 @@ class INT4XPULoRAStack:
 
 NODE_CLASS_MAPPINGS = {"INT4XPULoRAStack": INT4XPULoRAStack}
 NODE_DISPLAY_NAME_MAPPINGS = {"INT4XPULoRAStack": "INT4XPU LoRA Stack (up to 8)"}
-

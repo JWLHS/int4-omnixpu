@@ -590,9 +590,9 @@ class INT4XPULoRALoader:
         parent = model
         model = model.clone()
         install_detach(model)
-        if abs(strength) < 1e-5:
-            log.info("[int4 LoRA] ✗ 未使用 %s（strength=0）", lora_name)
-            return (model,)
+        # strength=0 也要登记规格：链里前面挂过同名 LoRA 时执行"归零=撤销"
+        # （int4_xpu_lora_sets._apply_zero_cancel，插件既有能力）；
+        # 链里没有同名时它就是纯 no-op（与原生一致：本次采样不注入）。
         int4_lora_sets.register(parent, model, [
             {"name": lora_name, "strength": float(strength), "kind": "loader"}])
         return (model,)

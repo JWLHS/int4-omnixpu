@@ -158,12 +158,42 @@ def _is_new_stage(st, timestep):
 
 # ── 对齐（多退少补）+ 阶段日志 ───────────────────────────────────────
 
+_ZERO_EPS = 1e-6
+
+
+def _apply_zero_cancel(specs):
+    """强度≈0 的规格 = 撤掉同一条链里**前面同名**的那个 LoRA（插件既有能力）。
+
+    这是旧同名槽位架构的"归零=撤销"语义：`A(1.0)→B(1.0)→A(0)` 应当只剩 B。
+    注意原生 ComfyUI 在 strength=0 时是"原对象直通"（`nodes.py` 的 `load_lora`
+    直接 return model），并不会撤销前面的同名 LoRA；这里按插件既有工作流习惯保留。
+    返回 ([(原始序号, spec), ...], [被撤销的名字, ...])：序号保留 → 规格键不漂移。
+    """
+    kept = []
+    cancelled = []
+    for i, s in enumerate(specs):
+        try:
+            v = float(s.get("strength", 1.0))
+        except Exception:
+            v = 1.0
+        if abs(v) < _ZERO_EPS:
+            nm = s.get("name")
+            before = len(kept)
+            kept = [it for it in kept if it[1].get("name") != nm]
+            if len(kept) != before:
+                cancelled.append(nm)
+            continue
+        kept.append((i, s))
+    return kept, cancelled
+
+
 def sync(model, specs, timestep=None):
     """把模型上的 LoRA 状态对齐到 specs。返回本次实际注入的条数。"""
     from .int4_xpu_lora_loader import apply_lora, remove_lora
 
+    kept, cancelled = _apply_zero_cancel(specs)
     st = applied_state(model)
-    want = [_sig(s, i) for i, s in enumerate(specs)]
+    want = [_sig(s, i) for i, s in kept]
     changed = st["dirty"] or tuple(want) != tuple(st["sigs"])
     new_stage = _is_new_stage(st, timestep)
     if not changed and not new_stage:
@@ -171,12 +201,14 @@ def sync(model, specs, timestep=None):
 
     injected, removed, injected_detail = [], 0, {}
     if changed:
+        for nm in cancelled:
+            log.info("[int4 LoRA] ✗ 撤销 %s（strength=0，撤掉链里同名的那次）", nm)
         have = {n: s for n, s in st["sigs"]}
         for name in list(have):
             if name not in {n for n, _s in want}:
                 remove_lora(model, name)
                 removed += 1
-        for index, spec in enumerate(specs):
+        for index, spec in kept:
             name, strength = _sig(spec, index)
             if not st["dirty"] and have.get(name) == strength and name in st["detail"]:
                 continue
@@ -201,7 +233,7 @@ def sync(model, specs, timestep=None):
             except Exception as e:
                 log.debug("[int4 LoRA] 预热重武装失败：%s", e)
 
-    _stage_log(specs, st, injected, new_stage, changed)
+    _stage_log(kept, st, injected, new_stage, changed)
     return len(injected)
 
 
@@ -214,7 +246,7 @@ def _stage_log(specs, st, injected, new_stage, changed):
     total_q = total_b = 0
     any_reuse = False
     kinds = set()
-    for index, spec in enumerate(specs):
+    for index, spec in specs:              # specs = [(原始序号, spec), ...]
         name = spec.get("name")
         strength = float(spec.get("strength", 1.0))
         key = _sig(spec, index)[0]
