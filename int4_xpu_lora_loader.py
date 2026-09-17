@@ -561,11 +561,43 @@ def install_detach(model):
     object.__setattr__(model, '_wa4_lora_detach_patched', True)
 
 
+def _is_int4_model(model) -> bool:
+    """判断这个 MODEL 是否由本插件的 int4 加载器加载。
+
+    判定与采样侧对齐钩子一致：patcher 上带 `wa4_int4`，或 diffusion_model 上带
+    `_wa4_lora_index`（原生加载器加载的模型两个都没有）。
+    """
+    try:
+        if (getattr(model, "model_options", None) or {}).get("wa4_int4"):
+            return True
+    except Exception:
+        pass
+    dm = getattr(model, "model", None)
+    while hasattr(dm, "_orig_mod"):
+        dm = dm._orig_mod
+    return dm is not None and getattr(dm, "_wa4_lora_index", None) is not None
+
+
+def _native_load_lora_model_only(model, lora_name, strength):
+    """非 int4 模型：完全走 ComfyUI 原生 LoRA 路径（与原生 LoraLoaderModelOnly 同源）。"""
+    try:
+        from nodes import LoraLoaderModelOnly
+        return LoraLoaderModelOnly().load_lora_model_only(model, lora_name, float(strength))
+    except Exception as e:
+        log.warning("[int4 LoRA] 原生模型走原生 LoRA 路径失败（%s），本节点跳过：%s",
+                    lora_name, e)
+        return (model,)
+
+
 class INT4XPULoRALoader:
     """薄壳节点：只记录"这一路要哪些 LoRA"，实际应用在采样时按活跃规格对齐。
 
     与原生 LoRA 节点同语义：`model.clone()` 后再追加规格 —— chained 节点叠加、
     并联分支各自独立、绕过节点等于不在链里。
+
+    非 int4 模型（原生加载器加载的 bf16/fp8/int8-convrot 等）：直接委托给
+    ComfyUI 原生 `LoraLoaderModelOnly`，行为与原生节点完全一致（含原生支持的
+    LoHa/LoKr/OFT/DoRA 等格式与 strength=0 直通）。
     """
 
     NAME = "INT4XPU LoRA Loader"
@@ -587,6 +619,8 @@ class INT4XPULoRALoader:
     DESCRIPTION = "在模型上叠加一个 LoRA（采样时应用，语义与原生 LoRA 节点一致）。"
 
     def load_lora(self, model, lora_name, strength):
+        if not _is_int4_model(model):
+            return _native_load_lora_model_only(model, lora_name, strength)
         parent = model
         model = model.clone()
         install_detach(model)
