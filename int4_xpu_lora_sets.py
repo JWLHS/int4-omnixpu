@@ -26,6 +26,14 @@ SPEC_KEY = "wa4_lora"
 
 _SETS = {}          # token -> {"specs": [...], "ref": weakref(patcher)}
 _SEQ = 0
+
+
+def _dead_ref():
+    """weakref 不可用时的占位。绝不能退化成 `lambda: child_patcher`——闭包会把
+    patcher（进而整个模型）钉在模块表里，正是本轮要根除的那类泄漏。"""
+    return None
+
+
 # 当前这次采样用的是哪一路 patcher（由 prepare_sampling 记录）。
 # 必须是弱引用：采样结束后 ComfyUI 就会卸载这个 patcher，强引用会把它连同
 # 整个模型（224 个 INT4 层 + CPU 权重）永久钉在模块里 → 每次加载模型多留一份
@@ -88,7 +96,7 @@ def register(parent_patcher, child_patcher, new_specs):
     try:
         ref = weakref.ref(child_patcher)
     except TypeError:
-        ref = lambda: child_patcher
+        ref = _dead_ref
     _SETS[token] = {"specs": specs, "ref": ref}
     try:
         opts = child_patcher.model_options.setdefault("transformer_options", {})
