@@ -9,7 +9,7 @@ import logging
 import folder_paths
 
 from . import int4_xpu_lora_sets as int4_lora_sets
-from .int4_xpu_lora_loader import install_detach, _is_int4_model, _native_load_lora_model_only
+from .int4_xpu_lora_loader import install_detach
 
 log = logging.getLogger("int4-LoRA-Stack")
 
@@ -34,16 +34,6 @@ class INT4XPULoRAStack:
     DESCRIPTION = "把最多 8 个 LoRA 作为一个整体叠加到模型上（采样时应用）。"
 
     def apply(self, model, **kwargs):
-        if not _is_int4_model(model):
-            # 非 int4 模型：按顺序委托原生 LoRA 路径（行为=原生链式叠加）
-            for i in range(1, 9):
-                name = kwargs.get(f"lora_name_{i}")
-                strength = kwargs.get(f"strength_{i}", 1.0)
-                if name is None or name == "None" or name == "":
-                    continue
-                out = _native_load_lora_model_only(model, name, strength)
-                model = out[0]
-            return (model,)
         parent = model
         model = model.clone()
         install_detach(model)
