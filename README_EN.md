@@ -250,6 +250,43 @@ then **our local test settings (reference only)** and why:
 
 ## Changelog
 
+- 2026-09-17 (memory leak fix): repeatedly loading/switching models in one process made
+  process memory climb monotonically to 89GB (65.7GB private), after which qwen OOM'd.
+  Root cause: two module-level strong references kept unloaded models alive —
+  `_ACTIVE["patcher"]` (which branch's patcher the current sampling uses; never cleared)
+  and `_norm_idx_cache` (layer-name index keyed by `id(index)`, whose values are the
+  model's modules themselves), plus a weakref fallback that degraded into a closure.
+  Fixed with a `weakref.ref`, clearing the index cache on every unload, and a
+  `None`-returning fallback. Measured: before, 448 INT4 layers stayed alive (two models,
+  11.94GB) and RSS went 17689→31791→…→89252MB; after, 224 layers (6.01GB) and RSS
+  oscillates 17677→31749→21001→20818MB without climbing.
+- 2026-09-17 (LoKr `w2_a/w2_b` factor format): LyCORIS's `lokr_w2_a` / `lokr_w2_b`
+  used to overwrite each other through substring matching (w2 kept only **half** a
+  factor), while the injection side faked the shape with block repeat/truncate and
+  **materialized a full kron delta per layer per forward** — on qwen that OOM'd
+  immediately (66GB peak). Now: factor keys are matched by exact suffix (w1 / w1_a /
+  w1_b / w2 / w2_a / w2_b / t2); quantized layers store factors only and apply them as
+  two small GEMMs following the kron block structure (no delta materialization); the
+  a/b decomposition is kept split; alpha follows native semantics (ignored for direct
+  factors, `alpha/rank` for a/b). Measured: the qwen LoKr went from error (XPU OOM,
+  66GB) to **success in 13.2s / 25.7GB peak**, injection 10.24s → 0.49s; all seven
+  local LoKr files pass (qwen nsfw adv, krea realism_engine, z-image age_v2 included).
+- 2026-09-17 ("zero = revoke" restored): a chained `strength=0` now revokes the
+  same-named LoRA applied earlier — `A(1.0)→B(1.0)→A(0)` is pixel-identical to
+  "B only" (mean=0.000) — while a single node at 0 simply does not inject (native
+  behaviour). Note: native ComfyUI passes the model through unchanged at strength 0
+  and does **not** revoke an earlier same-name LoRA; this is a preserved capability of
+  this plugin. LoRA Stack's zeroed slots follow the same rule, logging one line only
+  when a revocation actually happens.
+- 2026-09-17 (unload detection by semantics): `is_comfy_auto_unload()` used to rely on
+  the `execution.py` line range 820–860 to identify ComfyUI's prompt-end auto unload;
+  a ComfyUI version bump that moves those lines misclassifies it (effect: treating the
+  auto unload as an explicit cleanup → deep release every prompt → warm start 2–3s
+  slower, no errors). It now reads the source around the calling frame and looks for
+  semantic markers: `is_oom` → OOM fallback, `DISABLE_SMART_MEMORY` → prompt-end auto
+  unload, neither → treat as explicit. Measured: warm start 9.1s after auto unload
+  (cold 18.2s) with no deep-release log; `/free` leaves exactly one
+  `[int4-cleanup] released` and drops RSS 18.1GB → 4.37GB.
 - 2026-09-15 (LoRA now follows native semantics): LoRA no longer mutates the shared
   model in place — it follows the ModelPatcher. Nodes only register their spec
   (`model.clone()` + a token in that branch's `model_options["transformer_options"]`);

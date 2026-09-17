@@ -218,6 +218,35 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
 
 ## 更新记录
 
+- 2026-09-17（内存泄漏修复）：同一个进程里反复加载/切换模型，进程内存会**单调爬到 89GB**
+  （私有内存 65.7GB），随后 qwen 因为没内存 OOM。根因是两处**模块级强引用把已卸载的模型钉死**：
+  `int4_xpu_lora_sets._ACTIVE["patcher"]`（记录"本次采样用哪一路 patcher"，从不清理）与
+  `_norm_idx_cache`（按 `id(index)` 缓存层名索引，值里就是模型模块对象），外加 weakref 失败时
+  退化成闭包的兜底。现在：`_ACTIVE` 存 `weakref.ref`、每次卸载清空 `_norm_idx_cache`、
+  weakref 兜底改成返回 `None` 的占位函数。实测：改前进程内 448 个 INT4 层存活（两个模型、
+  11.94GB），RSS 17689→31791→…→89252MB 单调上涨；改后 224 个（6.01GB），RSS
+  17677→31749→21001→20818MB 起伏不涨。
+- 2026-09-17（LoKr 的 a/b 分解格式）：LyCORIS 的 `lokr_w2_a` / `lokr_w2_b` 以前被
+  子串匹配互相覆盖，w2 只剩**半个因子**；注入侧再用"整块重复/截断"硬凑形状，并且
+  **每层前向物化一份完整 kron delta** —— qwen 上 840 层直接 OOM（进程峰值 66GB）。
+  现在：按**完整后缀**识别 7 种因子键（w1 / w1_a / w1_b / w2 / w2_a / w2_b / t2）；
+  量化层只存因子，前向按 kron 块结构做两级小 GEMM（不再物化 delta）；a/b 分解不合并
+  （单独条目，前向两级小 GEMM）；alpha 对齐原生（直因子忽略 alpha，a/b 用 `alpha/rank`）。
+  实测：qwen 的 LoKr 由 error（XPU OOM / 峰值 66GB）→ **success 13.2s / 峰值 25.7GB**，
+  注入耗时 10.24s → 0.49s；本机 7 个 LoKr 全部通过（含 qwen nsfw adv、krea realism_engine、
+  z-image age_v2）。
+- 2026-09-17（恢复「归零=撤销同名 LoRA」）：链里**后置的 `strength=0` 会撤掉同名的那个
+  LoRA** —— `A(1.0)→B(1.0)→A(0)` 与「只加 B」逐像素相同（mean=0.000）；单个节点置 0
+  则等于不注入（与原生一致）。说明：原生 ComfyUI 在 `strength=0` 时是"原对象直通"、
+  **不会**撤销前面的同名 LoRA；本条是插件既有能力的保留（旧同名槽位架构的行为）。
+  节点与 Stack 的 0 强度槽走同一规则，仅在真正发生撤销时打一行日志。
+- 2026-09-17（卸载判定改为语义识别）：`is_comfy_auto_unload()` 原先靠 ComfyUI
+  `execution.py` 的 820–860 **行号区间**判断"提示词结束的自动卸载"，ComfyUI 换版本
+  挪动代码就会失准（失准后果：把自动卸载误判成显式清理 → 每轮深释放 → 热启动慢
+  2~3 秒，不出错）。现在改为读调用帧附近的源码认**语义标记**：`is_oom` → OOM 兜底、
+  `DISABLE_SMART_MEMORY` → 提示词结束的自动卸载、都认不出按显式清理处理。
+  实测：自动卸载后同模型热启动 9.1s（冷启动 18.2s）且无深释放日志；`/free`
+  显式清理恰好一条 `[int4-cleanup] released`，RSS 18.1GB → 4.37GB。
 - 2026-09-15（LoRA 架构向原生对齐）：LoRA 不再就地改共享模型，改为**跟着 ModelPatcher 走**——
   节点只登记规格（`model.clone()` + 把 token 写进这一路 patcher 的
   `model_options["transformer_options"]`），采样时读出该路规格，把模型上的 LoRA 状态
