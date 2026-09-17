@@ -154,16 +154,25 @@ def _rot_quarot_tensor(tensor, H, group_size):
     return (tensor.reshape(tensor.shape[0], ng, group_size) @ Hd.T).reshape(tensor.shape[0], tensor.shape[1])
 
 
+# LyCORIS LoKr 因子：必须按"完整后缀"识别。用子串匹配时 lokr_w2_a / lokr_w2_b
+# 都会命中 "lokr_w2"，后写入的因子把先写入的覆盖掉 —— w2 只剩半个因子，
+# 形状看着能对上（kron 行数靠"整块重复"硬凑），实际是错的，而且 delta 巨大。
+_LOKR_FACTOR_SUFFIXES = (
+    "lokr_w1", "lokr_w1_a", "lokr_w1_b",
+    "lokr_w2", "lokr_w2_a", "lokr_w2_b", "lokr_t2",
+)
+
+
 def _parse_raw_lora_sd(lora_sd: dict) -> dict[str, dict]:
     lora_data: dict[str, dict] = {}
     for key, tensor in lora_sd.items():
-        if "lokr_w1" in key:
-            idx = key.index("lokr_w1"); lp = _normalize_layer_path(key[:idx].rstrip("."))
-            if lp: lora_data.setdefault(lp, {})["lokr_w1"] = tensor; lora_data[lp]["type"] = "lokr"
-            continue
-        if "lokr_w2" in key:
-            idx = key.index("lokr_w2"); lp = _normalize_layer_path(key[:idx].rstrip("."))
-            if lp: lora_data.setdefault(lp, {})["lokr_w2"] = tensor; lora_data[lp]["type"] = "lokr"
+        dot = key.rfind(".")
+        suffix = key[dot + 1:] if dot >= 0 else key
+        if suffix in _LOKR_FACTOR_SUFFIXES:
+            lp = _normalize_layer_path(key[:dot].rstrip(".")) if dot >= 0 else ""
+            if lp:
+                lora_data.setdefault(lp, {})[suffix] = tensor
+                lora_data[lp]["type"] = "lokr"
             continue
         if "lora_up" in key or "lora_B" in key:
             idx = key.index("lora_up") if "lora_up" in key else key.index("lora_B")

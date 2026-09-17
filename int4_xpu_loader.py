@@ -423,18 +423,64 @@ def _wa4_release_model(model):
         torch.xpu.empty_cache()
 
 
-def _apply_lokr_factor(x2, o, w1, w2, mult):
-    """LoKR 因子直算：GPU 现算 kron(w1,w2) 的前 ti2 列，走原大 GEMM。
+def _lokr_fold_input(x2, c1, c2):
+    """把输入按 kron 的列结构折成 (N, c1, c2)。
 
-    GPU 只常驻 w1/w2 因子（约文件大小 1.5GB），每层前向临时物化一份
-    delta（模块权重大小，用完即弃），避免旧实现把 224 层整 delta 全量
-    常驻（~12GB）。速度与旧路径几乎一致（实测 +0.4~4ms/层）。
+    kron(w1, w2) 的列序是 (j 外, q 内)：第 j*c2+q 列对应 w1[:, j]×w2[:, q]。
+    旧实现是"列不够就把 kron 横向平铺、列超出就截断"；这里等价实现：
+    k > c1*c2 时按 c1*c2 分组求和（= 平铺后取前 k 列），k < c1*c2 时补零（= 截断）。
     """
-    k = x2.shape[1]
-    d = torch.kron(w1, w2)[:, :k]
-    lo = x2 @ d.t() * mult
+    k = int(x2.shape[-1])
+    l2 = c1 * c2
+    t = (k + l2 - 1) // l2
+    n = x2.numel() // max(k, 1)
+    x2 = x2.reshape(n, k)
+    if t * l2 != k:
+        x2 = torch.nn.functional.pad(x2, (0, t * l2 - k))
+    if t > 1:
+        x2 = x2.reshape(n, t, l2).sum(dim=1)
+    return x2.reshape(n, c1, c2)
+
+
+def _lokr_align_rows(lo, out_w):
+    """行补齐语义：kron 行数(out_l*out_k) 与模型 out 不一致时，先整块纵向重复再截断
+    （与注入侧旧实现 `delta.repeat(...)[:to2]` 完全一致）。"""
+    n_rows = lo.shape[1]
+    if n_rows == out_w:
+        return lo
+    if n_rows > out_w:
+        return lo[:, :out_w]
+    reps = (out_w + n_rows - 1) // n_rows
+    return lo.repeat(1, reps)[:, :out_w]
+
+
+def _apply_lokr_factor(x2, o, w1, w2, mult, w2_split=None):
+    """LoKR 因子直算：不物化 kron(w1,w2)——按块结构做两次小 GEMM。
+
+    kron 的块结构：D[i*r2+p, j*c2+q] = w1[i,j] * w2[p,q]，于是
+        x @ D^T = w1 @ ( (x 折成 [c1, c2]) @ w2^T )   再 reshape [r1*r2]
+    w2_split=(w2_a, w2_b) 时把内因子换成两级小 GEMM（不合并 a/b，省显存）。
+    旧实现每层前向物化一整份 delta（qwen 这种大层就是单层几百 MB 的瞬时分配），
+    这里是它的等价形式，分配只有 [N, c1, r2] 级别。
+    """
+    r1, c1 = w1.shape
+    if w2_split is None:
+        r2, c2 = w2.shape
+    else:
+        wa, wb = w2_split
+        r2, c2 = int(wa.shape[0]), int(wb.shape[1])
+    xs = _lokr_fold_input(x2, c1, c2)          # (N, c1, c2)
+    z = xs.reshape(-1, c2)
+    if w2_split is None:
+        z = z @ w2.t()                          # (N*c1, r2)
+    else:
+        wa, wb = w2_split
+        z = (z @ wb.t()) @ wa.t()               # (N*c1, r2)
+    z = z.reshape(xs.shape[0], c1, r2)
+    lo = torch.matmul(w1, z).reshape(xs.shape[0], r1 * r2)
+    lo = _lokr_align_rows(lo, o.shape[1]) * mult
     o += lo.to(o.dtype)
-    del lo, d
+    del lo, z, xs
     return o
 
 
@@ -465,6 +511,23 @@ def _apply_wa4_lora(module, x2, out, entries, dev, cd):
                     w2 = w2_cpu.to(dev, dtype=cd)
                     _gmap[("w2", id(w2_cpu))] = w2
                 _apply_lokr_factor(x2, o, w1, w2, mult)
+                continue
+            elif etype == "lokr2":
+                # LyCORIS w2 = w2_a @ w2_b 分解：不合并因子，前向两级小 GEMM
+                _, w1_cpu, wa_cpu, wb_cpu, mult = entry[:5]
+                w1 = _gmap.get(("w1", id(w1_cpu)))
+                if w1 is None:
+                    w1 = w1_cpu.to(dev, dtype=cd)
+                    _gmap[("w1", id(w1_cpu))] = w1
+                wa = _gmap.get(("w2a", id(wa_cpu)))
+                if wa is None:
+                    wa = wa_cpu.to(dev, dtype=cd)
+                    _gmap[("w2a", id(wa_cpu))] = wa
+                wb = _gmap.get(("w2b", id(wb_cpu)))
+                if wb is None:
+                    wb = wb_cpu.to(dev, dtype=cd)
+                    _gmap[("w2b", id(wb_cpu))] = wb
+                _apply_lokr_factor(x2, o, w1, None, mult, w2_split=(wa, wb))
                 continue
             elif etype == "delta":
                 _, delta_cpu, mult = entry[:3]

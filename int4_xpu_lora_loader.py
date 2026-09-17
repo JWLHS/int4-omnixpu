@@ -266,9 +266,12 @@ class _Wa4LoraWorker:
                     self._pop_module_lora(module, lora_name)
 
                     if lora_type == "lokr":
-                        w1 = info.get("lokr_w1"); w2 = info.get("lokr_w2")
-                        if w1 is None or w2 is None: continue
-                        self._inject_lokr(module, key, w1, w2, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant)
+                        res = _resolve_lokr(info)
+                        if res is None:
+                            log.debug("[int4 LoRA] LoKr 因子无法解析，跳过 %s", norm)
+                            continue
+                        w1, w2, lokr_rank = res
+                        self._inject_lokr(module, key, w1, w2, info.get("alpha"), strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=not is_quant, rank=lokr_rank)
                     else:
                         down = info.get("down"); up = info.get("up")
                         if down is None or up is None: continue
@@ -401,25 +404,44 @@ class _Wa4LoraWorker:
             else:
                 le.setdefault(lora_name, []).append((A, B, mult))
 
-    def _inject_lokr(self, module, lora_name, w1, w2, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False):
-        # █ 原样保留 █
-        w1_c = w1.to(cpu, torch.float16).clone(); w2_c = w2.to(cpu, torch.float16).clone()
+    def _inject_lokr(self, module, lora_name, w1, w2, alpha_val, strength, qkv_slice, quarot_enabled, H, group_size, dev, cpu, bake=False, rank=None):
+        # w2 可能是 (w2_a, w2_b) 因子对（LyCORIS 原生分解写法，w2 = a @ b）：
+        # 量化前向里按 a/b 直接做两级小 GEMM，不合并、不物化 kron。
+        split = isinstance(w2, (tuple, list)) and len(w2) == 2
+        w2a, w2b = (w2 if split else (None, None))
+        # 原生 LoKr 语义：alpha 只在因子做了 a/b 分解时生效（乘 alpha/rank）；
+        # 直给 w1/w2 时 alpha 被原生忽略（社区文件里的 alpha 常是垃圾值）。
+        mult = float(strength)
+        if alpha_val is not None and rank:
+            try:
+                mult *= float(alpha_val) / float(rank)
+            except Exception:
+                pass
         to2 = module.out_features if hasattr(module, "out_features") else module.weight.shape[0]
         ti2 = module.in_features if hasattr(module, "in_features") else module.weight.shape[1]
-        # ── LoKR 因子快速路径：不物化 kron(delta) ──────────────────────────
-        # 仅当 kron 行数==out 且输入宽正好是若干整段 w2 列（realism/Krea2 模式）
-        # 时使用；其余情形（bake/qkv 分片/quarot/不整除）原样走下方旧路径。
-        r1, c1 = w1_c.shape
-        r2, c2 = w2_c.shape
-        if (not bake and qkv_slice is None and not quarot_enabled
-                and r1 * r2 == to2 and ti2 % c2 == 0 and 0 < ti2 // c2 <= c1):
+        # ── 量化层：只存因子，前向按因子做小 GEMM（不物化 kron(delta)）─────
+        # 旧实现"每层前向临时物化一份 kron delta"，大层上就是每层几百 MB 的
+        # 瞬时分配（qwen LoKr 840 层直接撑爆 15.4GB 上限）；这里彻底去掉。
+        if not bake and qkv_slice is None and not quarot_enabled:
             le = getattr(module, '_wa4_lora_entries', None)
             if le is None:
                 le = {}
                 object.__setattr__(module, '_wa4_lora_entries', le)
-            le.setdefault(lora_name, []).append(
-                ("lokr", w1_c.contiguous(), w2_c.contiguous(), strength))
+            w1_c = w1.to(cpu, torch.float16).contiguous().clone()
+            if split:
+                a_c = w2a.to(cpu, torch.float16).contiguous().clone()
+                b_c = w2b.to(cpu, torch.float16).contiguous().clone()
+                le.setdefault(lora_name, []).append(("lokr2", w1_c, a_c, b_c, mult))
+            else:
+                w2_c = w2.to(cpu, torch.float16).contiguous().clone()
+                le.setdefault(lora_name, []).append(("lokr", w1_c, w2_c, mult))
             return
+        # ── 其余（bake / fused qkv 分片 / quarot 旋转）：需要具体的 delta ──
+        w1_c = w1.to(cpu, torch.float16).clone()
+        if split:
+            w2_c = (w2a.to(cpu, torch.float16) @ w2b.to(cpu, torch.float16)).clone()
+        else:
+            w2_c = w2.to(cpu, torch.float16).clone()
         delta = torch.kron(w1_c, w2_c)
         if delta.shape[0] < to2: delta = delta.repeat((to2 + delta.shape[0] - 1) // delta.shape[0], 1)
         if delta.shape[0] > to2: delta = delta[:to2, :]
@@ -435,7 +457,7 @@ class _Wa4LoraWorker:
             if not isinstance(pending, dict): pending = {}; bs['_pending'] = pending
             sl = qkv_slice[0] if qkv_slice else None
             se = qkv_slice[1] if qkv_slice else None
-            pending.setdefault(lora_name, []).append(("delta", delta, strength, sl, se))
+            pending.setdefault(lora_name, []).append(("delta", delta, mult, sl, se))
             if '_hook_handle' not in bs:
                 _bake_fn = _make_bake_pre_hook(module)
                 hook = module.register_forward_pre_hook(_bake_fn)
@@ -447,9 +469,50 @@ class _Wa4LoraWorker:
             if qkv_slice is not None:
                 sl, se = qkv_slice
                 le.setdefault(lora_name, []).append(
-                    ("delta", delta[sl:se, :].contiguous().clone(), strength, sl, se))
+                    ("delta", delta[sl:se, :].contiguous().clone(), mult, sl, se))
             else:
-                le.setdefault(lora_name, []).append(("delta", delta, strength))
+                le.setdefault(lora_name, []).append(("delta", delta, mult))
+
+
+def _resolve_lokr(info):
+    """解析 LoKr 因子：LyCORIS 的 a/b 分解与 tucker 形式统一成注入用形式。
+
+    返回 (w1, w2, rank)：w2 是张量（直因子）或 (w2_a, w2_b) 因子对；
+    rank 是原生 alpha/dim 里的 dim（只有用了 a/b 分解时非 None）。
+    返回 None 表示不支持（例如 tucker 卷积的 4D 因子）。
+    """
+    cached = info.get("_lokr_res", False)
+    if cached is not False:
+        return cached
+    w1, w1a, w1b = info.get("lokr_w1"), info.get("lokr_w1_a"), info.get("lokr_w1_b")
+    w2, w2a, w2b = info.get("lokr_w2"), info.get("lokr_w2_a"), info.get("lokr_w2_b")
+    t2 = info.get("lokr_t2")
+    rank = None
+    ok = True
+    if w1 is None:
+        if w1a is not None and w1b is not None:
+            w1 = w1a.to(torch.float32) @ w1b.to(torch.float32)   # 外因子体积小，直接合并
+            rank = int(w1b.shape[0])
+        else:
+            ok = False
+    if ok and w2 is None:
+        if w2a is not None and w2b is not None:
+            if t2 is None:
+                w2 = (w2a, w2b)                                  # 内因子保持 a/b，前向两级小 GEMM
+            else:
+                w2 = torch.einsum("i j k l, j r, i p -> p r k l",
+                                  t2.to(torch.float32), w2b.to(torch.float32), w2a.to(torch.float32))
+                if w2.dim() == 4 and w2.shape[-1] == 1 and w2.shape[-2] == 1:
+                    w2 = w2.squeeze(-1).squeeze(-1)
+                if w2.dim() != 2:
+                    ok = False                                   # 卷积 tucker：本插件不处理
+            if ok and rank is None:
+                rank = int(w2b.shape[0])
+        else:
+            ok = False
+    res = (w1, w2, rank) if (ok and w1 is not None and w2 is not None) else None
+    info["_lokr_res"] = res
+    return res
 
 
 _WORKER = _Wa4LoraWorker()
