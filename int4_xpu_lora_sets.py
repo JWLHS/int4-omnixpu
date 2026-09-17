@@ -26,15 +26,23 @@ SPEC_KEY = "wa4_lora"
 
 _SETS = {}          # token -> {"specs": [...], "ref": weakref(patcher)}
 _SEQ = 0
-_ACTIVE = {"patcher": None}   # 当前这次采样用的是哪一路 patcher（由 prepare_sampling 记录）
+# 当前这次采样用的是哪一路 patcher（由 prepare_sampling 记录）。
+# 必须是弱引用：采样结束后 ComfyUI 就会卸载这个 patcher，强引用会把它连同
+# 整个模型（224 个 INT4 层 + CPU 权重）永久钉在模块里 → 每次加载模型多留一份
+# 内存，连开几个模型就把机器吃光。采样期间 patcher 一定活着，弱引用读得到。
+_ACTIVE = {"patcher_ref": None}
 
 
 def set_active_patcher(patcher):
-    _ACTIVE["patcher"] = patcher
+    try:
+        _ACTIVE["patcher_ref"] = weakref.ref(patcher)
+    except TypeError:
+        _ACTIVE["patcher_ref"] = None
 
 
 def active_patcher():
-    return _ACTIVE["patcher"]
+    ref = _ACTIVE.get("patcher_ref")
+    return ref() if ref is not None else None
 
 
 # ── 规格表 ────────────────────────────────────────────────────────────

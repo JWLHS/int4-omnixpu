@@ -408,6 +408,16 @@ def _wa4_release_model(model):
     else:
         INT4XPULinear._prewarm_target = None
         INT4XPULinear._prewarm_done = False
+    # _norm_idx_cache 按 id(index) 缓存"规范化后的层名索引"，值里就是模型的
+    # 模块对象 —— 不清就是整个模型被模块级缓存钉住。它只是省几次 dict 键重写，
+    # 每次卸载都清掉，代价可以忽略。
+    # 以前的清理只在显式深释放路径跑（_release(deep=True)），常规换模型不经过，
+    # 所以模型会随每次加载累积。
+    try:
+        from .int4_xpu_lora_common import _norm_idx_cache
+        _norm_idx_cache.clear()
+    except Exception:
+        pass
     if not _aimdo_manages() and not keep_resident:
         torch.xpu.synchronize()
         torch.xpu.empty_cache()
