@@ -28,10 +28,21 @@ def is_comfy_auto_unload():
     """True when unload_all_models comes from ComfyUI's prompt-end auto unload
     (execution.py DISABLE_SMART_MEMORY block, independent of wrapper order)."""
     try:
-        for f in traceback.extract_stack(limit=12):
-            if f.filename.replace("\\", "/").endswith("execution.py"):
-                if 820 <= f.lineno <= 860:
-                    return True
+        import linecache
+        for f in traceback.extract_stack(limit=16):
+            if not f.filename.replace("\\", "/").endswith("execution.py"):
+                continue
+            lines = linecache.getlines(f.filename)
+            if not lines:
+                continue
+            # 认语义标记而不是行号：ComfyUI 每次改版本挪代码都不会失效
+            ctx = "".join(lines[max(0, f.lineno - 10): f.lineno + 2])
+            if "unload_all_models" not in ctx:
+                continue
+            if "is_oom" in ctx:               # OOM 兜底那处：必须深释放
+                return False
+            if "DISABLE_SMART_MEMORY" in ctx:  # 提示词结束的自动卸载：保留常驻
+                return True
     except Exception:
         pass
     return False
