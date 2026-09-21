@@ -218,6 +218,21 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
 
 ## 更新记录
 
+- 2026-09-21（Qwen Image 2.1 支持）：新架构是 32 块单流（融合 `img_mlp.gate_up`、顶层共享
+  adaLN），与 Qwen Image 1.0 的 60 块双流完全不同，插件三处适配：① `QwenImage21` 跳过
+  omni norm —— 它的 `txt_in.text_norm` 是 `ZeroCenteredRMSNorm`（存的是 `scale-1`，实测
+  mean=-0.807 → 真实 scale≈0.193），omni wrapper 只吃 `self.weight`、不做 `+1.0`，会算出
+  符号与量级都错的输出；② 量化时对 `qwen` 类型新增 `"modulation"` 排除项 —— 2.1 把 adaLN
+  挪成顶层共享层 `modulation.1`（67M 参数、驱动全部 32 个 block），逐层量化相对误差
+  0.160（全场最高，block 层约 0.10），保留原精度只多 100MB（3.7GiB 的 +2.7%）；③ 三个
+  int4 Linear 替身（`INT4XPULinear` / `Int4LinearPython` / `Int4LinearTorchao`）补上 comfy
+  Linear 的接口面（`weight_function` / `bias_function` / `weight=None`）—— 2.1 的 SwiGLU
+  走 `comfy.ops.linear_input_act`，该函数与 OmniXPU 的 `fp8_gemm` 适配器都要读这三个属性，
+  缺了直接 `AttributeError` 中断采样。实测（A770，cf）：13.25GiB bf16 源 →
+  wa4 3.71GiB / tint4 3.66GiB，192 层量化层全部注入、`Config: QwenImage21`，
+  文生图与图像编辑均实跑通过；单层核验 kernel 输出与"理想量化权重"矩阵乘的相对误差 0.003
+  （bf16 舍入级），即与 bf16 的 ~11% 偏差纯粹是 4bit 权重固有问题，不是打包/布局错误。
+  采样期内存 7.4GB（同条件 int8 为 11.2GB）、显存剩余 9.2GB（int8 为 4.1GB）。
 - 2026-09-17（内存泄漏修复）：同一个进程里反复加载/切换模型，进程内存会**单调爬到 89GB**
   （私有内存 65.7GB），随后 qwen 因为没内存 OOM。根因是两处**模块级强引用把已卸载的模型钉死**：
   `int4_xpu_lora_sets._ACTIVE["patcher"]`（记录"本次采样用哪一路 patcher"，从不清理）与
