@@ -17,7 +17,10 @@ for _name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnu
     _t = getattr(torch, _name, None)
     if _t is not None: _FP8_TYPES.add(_t)
 
-_OMNI_NORM_SKIP = {"Boogu", "QwenImage", "Wan", "CogVideoX", "ZImage", "Lens", "Lightricks"}
+# QwenImage21：txt_in.text_norm 是 ZeroCenteredRMSNorm（存的是 scale-1），
+# omni norm wrapper 只吃 self.weight、不做 +1.0，会算出符号/量级都错的输出
+# （实测该权重 mean=-0.807 → 真实 scale≈0.193）→ 与 QwenImage 一样跳过。
+_OMNI_NORM_SKIP = {"Boogu", "QwenImage", "QwenImage21", "Wan", "CogVideoX", "ZImage", "Lens", "Lightricks"}
 _WA4_SYNC = os.environ.get("OMNIXPU_INT4_SYNC", "1") != "0"
 _WA4_SYNC_EVERY = int(os.environ.get("OMNIXPU_INT4_SYNC_EVERY", "64"))
 _RAM_TRACE = os.environ.get("OMNIXPU_RAM_TRACE", "0") != "0"
@@ -138,6 +141,14 @@ class Int4LinearPython(nn.Module):
         object.__setattr__(self, "_wa4_lora_entries", None)
         object.__setattr__(self, "_wa4_lora_gpu", None)
 
+        # comfy 0.36 Linear 接口面（ops.py CastWeightBiasOp/disable_weight_init）：
+        # comfy.ops.linear_input_act 与 OmniXPU 的 fp8_gemm 适配器都会读
+        # len(weight_function) / linear.weight；缺属性会 AttributeError
+        # （Qwen Image 2.1 的 SwiGLUFeedForward 走 linear_input_act）。
+        self.weight_function = []
+        self.bias_function = []
+        self.weight = None
+
     def _dequant(self, dev):
         packed = self._packed.to(dev)
         N, half = packed.shape
@@ -195,6 +206,14 @@ class Int4LinearTorchao(nn.Module):
         object.__setattr__(self, "_qt", None)
         object.__setattr__(self, "_wa4_lora_entries", None)
         object.__setattr__(self, "_wa4_lora_gpu", None)
+
+        # comfy 0.36 Linear 接口面（ops.py CastWeightBiasOp/disable_weight_init）：
+        # comfy.ops.linear_input_act 与 OmniXPU 的 fp8_gemm 适配器都会读
+        # len(weight_function) / linear.weight；缺属性会 AttributeError
+        # （Qwen Image 2.1 的 SwiGLUFeedForward 走 linear_input_act）。
+        self.weight_function = []
+        self.bias_function = []
+        self.weight = None
 
     def forward(self, x):
         dev = x.device
@@ -1158,6 +1177,13 @@ class INT4XPULinear(nn.Module):
         # "fp16" (default) keeps the classic behaviour; "s8" returns W4ActS8
         # from w4a8 forward so chained INT4XPULinear layers can skip re-quantizing.
         object.__setattr__(self, "_out_mode", out_mode)
+        # comfy 0.36 Linear 接口面（ops.py CastWeightBiasOp/disable_weight_init）：
+        # comfy.ops.linear_input_act 与 OmniXPU 的 fp8_gemm 适配器都会读
+        # len(weight_function) / linear.weight；缺属性会 AttributeError
+        # （Qwen Image 2.1 的 SwiGLUFeedForward 走 linear_input_act）。
+        self.weight_function = []
+        self.bias_function = []
+        self.weight = None
 
     def _preload_to_xpu(self, dev):
         """Prepare + move this layer's weights to dev (used by prewarm)."""
