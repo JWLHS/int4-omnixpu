@@ -46,5 +46,5 @@ def patch_aimdo_xpu(model) -> bool:
         return False
     if _orig_cuda_sync is not None:
         torch.cuda.synchronize = _noop_sync
-    log.info("[int4] AIMDO: active (XPU allocator replaced) — 模型与 LoRA 均由其管控")
+    log.debug("[int4] AIMDO: active (XPU allocator replaced) — 模型与 LoRA 均由其管控")
     return True

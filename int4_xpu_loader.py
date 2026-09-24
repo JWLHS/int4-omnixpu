@@ -1435,7 +1435,7 @@ class INT4XPULinear(nn.Module):
             out_shape = s[:-1] + (o.shape[-1],)
             INT4XPULinear._call_count += 1
             if INT4XPULinear._call_count % 500 == 0:
-                log.info("[int4] %d forward calls, xpu mem: %dMB (s8-out)",
+                log.debug("[int4] %d forward calls, xpu mem: %dMB (s8-out)",
                          INT4XPULinear._call_count,
                          torch.xpu.memory_allocated() // 1024 // 1024)
             if _empty_cache_enabled():
@@ -1474,7 +1474,7 @@ class INT4XPULinear(nn.Module):
         o = o.to(x_dtype)
         INT4XPULinear._call_count += 1
         if INT4XPULinear._call_count % 500 == 0:
-            log.info("[int4] %d forward calls, xpu mem: %dMB",
+            log.debug("[int4] %d forward calls, xpu mem: %dMB",
                      INT4XPULinear._call_count, torch.xpu.memory_allocated() // 1024 // 1024)
         if _empty_cache_enabled():
             _empty_cache()
@@ -1704,14 +1704,14 @@ def _index_int4_from_sd(sd, backend="w4a16", mode="kernel"):
     if _TIMING and _n_conv:
         log.info("[int4-timing] tint4 conversions: %d layers, wall %.2fs (avg %.3fs)",
                  _n_conv, _t_conv, _t_conv / _n_conv)
-    log.info("[int4] Indexed %d INT4 groups", len(quant))
+    log.debug("[int4] Indexed %d INT4 groups", len(quant))
     return quant
 
 
 def _patch_omni_norm(model, cfg_type):
     """omni norm V3：Krea2 scale+1.0 + wrapper 跳过"""
     if cfg_type in _OMNI_NORM_SKIP:
-        log.info("[int4] omni norm: skipped (model=%s)", cfg_type)
+        log.debug("[int4] omni norm: skipped (model=%s)", cfg_type)
         return
     try:
         from omni_xpu_kernel import norm as onorm
@@ -1750,7 +1750,7 @@ def _patch_omni_norm(model, cfg_type):
                     return y.reshape(x.shape)
                 m.forward = _ln_fwd.__get__(m)
                 patched += 1
-        log.info("[int4] omni norm patched: %d", patched)
+        log.debug("[int4] omni norm patched: %d", patched)
     except ImportError:
         pass
     except Exception:
@@ -1844,7 +1844,7 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
             if _m.bias is not None and _m.bias.dtype != act_dtype:
                 _m.bias.data = _m.bias.data.to(act_dtype)
     if _n_cast:
-        log.info("[int4] cast %d unquantized Linear to %s (AIMDO lazy dtype align)",
+        log.debug("[int4] cast %d unquantized Linear to %s (AIMDO lazy dtype align)",
                  _n_cast, act_dtype)
     if os.environ.get("OMNIXPU_INT4_BIAS_DIAG", "0") != "0":
         _n_wl = sum(1 for _m in model.modules() if isinstance(_m, INT4XPULinear))
@@ -1852,7 +1852,7 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
                     if isinstance(_m, INT4XPULinear) and _m.bias is not None)
         log.info("[int4] bias diag: INT4XPULinear=%d with_bias=%d", _n_wl, _n_wb)
     gc.collect()
-    log.info("[int4] Pre-injected %d INT4XPULinear (act_dtype=%s), freed %.2f GB",
+    log.debug("[int4] Pre-injected %d INT4XPULinear (act_dtype=%s), freed %.2f GB",
              injected, act_dtype, freed / 1024 ** 3)
     for key in list(sd.keys()):
         if key.endswith(".weight_scale") or key.endswith(".w4a4_group_size"): sd.pop(key, None)
@@ -1863,7 +1863,7 @@ def _inject_wa4_pre_load(model, sd, quant_info, cfg_type="",
     object.__setattr__(model, '_wa4_lora_index', index)
     object.__setattr__(model, '_wa4_quarot_enabled', use_quarot)
     object.__setattr__(model, '_wa4_quarot_gs', qgs)
-    log.info("[int4] LoRA index: %d entries (QuaRot=%s)", len(index), use_quarot)
+    log.debug("[int4] LoRA index: %d entries (QuaRot=%s)", len(index), use_quarot)
 
     if quant_info:
         log.warning("[int4] ⚠ Unmatched quant_info keys (%d): %s ...",
@@ -1912,8 +1912,8 @@ class int4XPUModelLoader:
                 if isinstance(_v, torch.Tensor) and _v.dtype == torch.bfloat16:
                     weight_dtype = torch.bfloat16
                     break
-            log.info("[int4] tint4 dtype inferred: %s", weight_dtype)
-        log.info("[int4] weight_dtype=%s (from file marker)", weight_dtype)
+            log.debug("[int4] tint4 dtype inferred: %s", weight_dtype)
+        log.debug("[int4] weight_dtype=%s (from file marker)", weight_dtype)
 
         use_quarot = bool(sd.pop("__w4a4_quarot__", torch.tensor(0)).item())
         qgs = int(sd.pop("__w4a4_quarot_group_size__", torch.tensor(128)).item()) if use_quarot else 128
@@ -1929,12 +1929,12 @@ class int4XPUModelLoader:
             except Exception:
                 qgs = 128
             use_quarot = True
-            log.info("[int4] TINT4 QuaRot ON (gs=%d)", qgs)
+            log.debug("[int4] TINT4 QuaRot ON (gs=%d)", qgs)
         if use_quarot:
             try:
                 from .int4_xpu_quarot import build_hadamard
                 hadamard_H = build_hadamard(qgs, device="cpu", dtype=torch.float32)
-                log.info("[int4] QuaRot ON, gs=%d, H built", qgs)
+                log.debug("[int4] QuaRot ON, gs=%d, H built", qgs)
             except Exception as e:
                 log.warning("[int4] QuaRot H build failed: %s", e)
                 use_quarot = False
@@ -1943,7 +1943,7 @@ class int4XPUModelLoader:
         if fp8_keys:
             for k in fp8_keys:
                 sd[k] = sd[k].to(weight_dtype)
-            log.info("[int4] Converted %d FP8 tensors → %s", len(fp8_keys), weight_dtype)
+            log.debug("[int4] Converted %d FP8 tensors → %s", len(fp8_keys), weight_dtype)
             _ram_trace("fp8 converted")
 
         # ── 融合回退阶梯：w4a4 → w4a8 → w4a16 → python / torchao ──
@@ -1983,7 +1983,7 @@ class int4XPUModelLoader:
                 _mode = "kernel" if caps["int4"] else "python"
                 if _mode == "python":
                     log.warning("[int4] int4 kernel 不可用，回退纯 python 反量化")
-        log.info("[int4] backend=%s mode=%s caps=%s", backend, _mode, caps)
+        log.debug("[int4] backend=%s mode=%s caps=%s", backend, _mode, caps)
 
         qi = _index_int4_from_sd(sd, backend=backend, mode=_mode)
         _t = _tphase("int4 indexed", _t)
@@ -2042,14 +2042,14 @@ class int4XPUModelLoader:
         if cfg is not None and _t4_edit_marker:
             try:
                 cfg.unet_config["default_ref_method"] = "index_timestep_zero"
-                log.info("[int4] default_ref_method=index_timestep_zero (tint4 edit marker)")
+                log.debug("[int4] default_ref_method=index_timestep_zero (tint4 edit marker)")
             except Exception:
                 pass
-        log.info("[int4] Config: %s%s", cfg_type, " [QuaRot]" if use_quarot else "")
+        log.debug("[int4] Config: %s%s", cfg_type, " [QuaRot]" if use_quarot else "")
         if cfg is None: raise RuntimeError("[int4] Architecture detection failed")
 
         act_dtype = weight_dtype
-        log.info("[int4] act_dtype=%s (跟随量化器标记)", act_dtype)
+        log.debug("[int4] act_dtype=%s (跟随量化器标记)", act_dtype)
 
         _o1 = md.model_config_from_unet
         md.model_config_from_unet = lambda *a, **kw: cfg
@@ -2111,18 +2111,18 @@ class int4XPUModelLoader:
             if backend == "w4a8" and cfg_type == "QwenImage":
                 n_attn = _wrap_qwenimage_attn_shared_quant(dm)
                 if n_attn:
-                    log.info("[int4] QwenImage s8 closure: shared-quant %d attention blocks",
+                    log.debug("[int4] QwenImage s8 closure: shared-quant %d attention blocks",
                              n_attn)
                 # GELU s8-out：默认开启（QW 实测稳定路径）。需要 A/B 时设
                 # OMNIXPU_INT4_GELU_S8=0 关闭。
                 if os.environ.get("OMNIXPU_INT4_GELU_S8", "1") != "0":
                     n_gelu = _wrap_qwenimage_gelu_s8(dm)
                     if n_gelu:
-                        log.info("[int4] QwenImage s8 closure: gelu s8-out on %d MLPs",
+                        log.debug("[int4] QwenImage s8 closure: gelu s8-out on %d MLPs",
                                  n_gelu)
                 n_lin, n_gate = _wrap_qwenimage_block_s8(dm)
                 if n_lin or n_gate:
-                    log.info("[int4] QwenImage s8 closure: s8-out on %d proj, "
+                    log.debug("[int4] QwenImage s8 closure: s8-out on %d proj, "
                              "%d gates dequant", n_lin, n_gate)
             elif backend == "w4a8":
                 # 通用闭包：任何架构（FLUX/Krea2/ZIT/Boogu/...）按角色识别
@@ -2130,10 +2130,10 @@ class int4XPUModelLoader:
                 # 张量协议自动反量化。
                 if os.environ.get("OMNIXPU_INT4_AUTO_S8", "1") != "0":
                     counts = _auto_s8_closure(dm)
-                    log.info("[int4] auto s8 closure: out_s8=%d attn_shared=%d swiglu=%d",
+                    log.debug("[int4] auto s8 closure: out_s8=%d attn_shared=%d swiglu=%d",
                              counts["out_s8"], counts["attn_shared"], counts["swiglu"])
                 else:
-                    log.info("[int4] auto s8 closure: DISABLED (OMNIXPU_INT4_AUTO_S8=0)")
+                    log.debug("[int4] auto s8 closure: DISABLED (OMNIXPU_INT4_AUTO_S8=0)")
         except Exception as e:
             log.warning("[int4] s8 closure setup skipped: %s", e)
 

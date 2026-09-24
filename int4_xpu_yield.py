@@ -1,4 +1,4 @@
-"""加载让路：别的模型要用显存时，把 int4 模型按 ComfyUI 正常路径卸下来。
+"""显存不够时，把 int4 模型按 ComfyUI 正常路径卸下来（给下一个模型腾地方）。
 
 为什么需要
 ----------
@@ -17,7 +17,7 @@ that works on-demand"），而"按需"这个前提对插件自持的设备张量
 ------------
 在 `comfy.model_management.load_models_gpu` 上挂一层。**只有同时满足**
 
-  ① 场上还有**本次不加载**的 int4 模型占着设备（我们要给它让路），
+  ① 场上还有**本次不加载**的 int4 模型占着设备，
   ② 这次要加载的模型不是"场上那个模型本身"（同模型重载无东西可让），且
   ③ 当前空闲显存 < 这次加载所需（min_inference / memory_required + reserved）
 
@@ -183,9 +183,7 @@ def _maybe_yield(model_management, models, args, kwargs) -> None:
             keep_loaded.append(loaded)
 
     unloaded = model_management.free_memory(need, device, keep_loaded=keep_loaded, for_dynamic=False)
-    if not unloaded:
-        log.debug("[int4] 让路：显存不足但 ComfyUI 没有可卸的模型（需 %.0f MiB / 剩 %.0f MiB）",
-                  need / (1024 ** 2), free / (1024 ** 2))
+    if not unloaded or not log.isEnabledFor(logging.DEBUG):
         return
 
     names = []
@@ -200,22 +198,17 @@ def _maybe_yield(model_management, models, args, kwargs) -> None:
         if model is not None:
             incoming_name = model.__class__.__name__
             break
-    log.info(
-        "[int4] 让路：加载 %s 需 %.0f MiB、仅剩 %.0f MiB → 卸下 %s（下次用到时按正常路径重载，"
-        "热启动保留解析结果）",
-        incoming_name or "下一个模型",
-        need / (1024 ** 2),
-        free / (1024 ** 2),
-        "/".join(names) or "已加载模型",
-    )
+    log.debug("[int4] 卸载 %s → 加载 %s（需 %.0f MiB / 剩 %.0f MiB）",
+              "/".join(names) or "模型", incoming_name or "下一个模型",
+              need / (1024 ** 2), free / (1024 ** 2))
 
 
 def apply_load_yield_patch() -> bool:
-    """在 comfy.model_management.load_models_gpu 上挂让路层（全局只挂一次）。"""
+    """在 comfy.model_management.load_models_gpu 上挂一层（全局只挂一次）。"""
     try:
         import comfy.model_management as model_management
     except Exception as exc:
-        log.debug("[int4] 让路补丁跳过（import 失败）：%r", exc)
+        log.debug("[int4] 卸载补丁跳过（import 失败）：%r", exc)
         return False
 
     original = getattr(model_management, "load_models_gpu", None)
@@ -230,12 +223,12 @@ def apply_load_yield_patch() -> bool:
             try:
                 _maybe_yield(model_management, models, args, kwargs)
             except Exception as exc:
-                log.debug("[int4] 让路检查失败（按原行为继续）：%r", exc)
+                log.debug("[int4] 卸载检查失败（按原行为继续）：%r", exc)
         return original(models, *args, **kwargs)
 
     setattr(load_models_gpu_with_yield, _PATCH_MARKER, original)
     model_management.load_models_gpu = load_models_gpu_with_yield
-    log.debug("[int4] load yield patch active")
+    log.debug("[int4] 卸载补丁已启用")
     return True
 
 
