@@ -2028,9 +2028,13 @@ class int4XPUModelLoader:
             log.warning("[int4] tint4 conv cache release failed: %r", _e)
 
         import comfy.model_detection as md
+        # 检测锚点键必须保留：ComfyUI 新版用它们区分架构（缺 cap_pad_token 会把
+        # Z-Image 判成 MingImage），过滤掉就会构建错模型。
         clean_sd = {k: v for k, v in sd.items()
                     if k.endswith((".weight", ".bias", ".scale"))
-                    or k.startswith(("text_encoders.", "vae."))}
+                    or k.startswith(("text_encoders.", "vae."))
+                    or k.endswith(("cap_pad_token", "__ming_image__",
+                                   "__index_timestep_zero__", "rope.inv_freq"))}
         prefix = md.unet_prefix_from_state_dict(clean_sd)
         tsd = comfy.utils.state_dict_prefix_replace(clean_sd, {prefix: ""}, filter_keys=True)
         cfg = md.model_config_from_unet(tsd if len(tsd) > 0 else clean_sd, "")
