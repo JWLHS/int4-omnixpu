@@ -552,9 +552,15 @@ def install_detach(model):
             log.debug("[int4 LoRA] 显存释放失败：%s", e)
         try:
             _wa4_reset_all_loras(model)
-            int4_lora_sets.mark_dirty(model)
         except Exception as e:
             log.debug("[int4 LoRA] 卸载清理失败：%s", e)
+        finally:
+            # 清条目与标脏必须成对：reset 抛异常时也要让下次采样重建，
+            # 否则会带着"状态干净但 LoRA 已被清掉"的假象复用 → LoRA 静默失效。
+            try:
+                int4_lora_sets.mark_dirty(model)
+            except Exception as e:
+                log.debug("[int4 LoRA] mark_dirty 失败：%s", e)
         return _orig_detach(unpatch_all)
 
     object.__setattr__(model, 'detach', _wa4_detach)

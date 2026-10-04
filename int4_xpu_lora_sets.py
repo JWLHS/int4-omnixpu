@@ -10,6 +10,9 @@
     → 拿到这一路的规格 → `sync()` 把模型上的 LoRA 状态**对齐**到规格（多退少补）。
     签名相同就什么都不做（零开销，替代旧的"去重跳过"）。
   - 卸载：`mark_dirty()`（模型上的 LoRA 状态失效）→ 下次采样按**活跃规格**重建。
+  - **跨运行不复用**：LoRA 加载节点每次执行都会生成新的 token；从未见过的 token
+    （= 新的一次运行/新的分支）一律强制重新对齐，只有"本次运行内已见过、且签名相同"
+    才复用。热启动只保留模型侧的打包/预热产物，不保留上一次运行挂上去的 LoRA。
 
 日志只报结果：每次采样阶段打印"这一刻真正生效的 LoRA"；过程信息一律 debug。
 """
@@ -54,6 +57,24 @@ def active_patcher():
 
 
 # ── 规格表 ────────────────────────────────────────────────────────────
+
+def token_of_options(transformer_options):
+    """读采样时传下来的规格 token（没有则 None）。"""
+    if not isinstance(transformer_options, dict):
+        return None
+    token = transformer_options.get(SPEC_KEY)
+    return token if isinstance(token, str) else None
+
+
+def token_of(patcher):
+    """读某个 ModelPatcher 这一路的规格 token（没有则 None）。"""
+    try:
+        opts = patcher.model_options.get("transformer_options") or {}
+    except Exception:
+        return None
+    token = opts.get(SPEC_KEY)
+    return token if isinstance(token, str) else None
+
 
 def specs_of(patcher):
     """读某个 ModelPatcher 这一路的 LoRA 规格（没有则空表）。"""
@@ -123,7 +144,8 @@ def parse_lora(path):
 def applied_state(model):
     st = getattr(model.model, "_wa4_applied_loras", None)
     if st is None:
-        st = {"sigs": (), "detail": {}, "dirty": True, "last_t": None}
+        st = {"sigs": (), "detail": {}, "dirty": True, "last_t": None,
+              "seen": set()}
         object.__setattr__(model.model, "_wa4_applied_loras", st)
     return st
 
@@ -134,6 +156,7 @@ def mark_dirty(model):
     st["sigs"] = ()
     st["detail"] = {}
     st["dirty"] = True
+    st["seen"] = set()
 
 
 def _sig(spec, index):
@@ -187,14 +210,19 @@ def _apply_zero_cancel(specs):
     return kept, cancelled
 
 
-def sync(model, specs, timestep=None):
+def sync(model, specs, timestep=None, token=None):
     """把模型上的 LoRA 状态对齐到 specs。返回本次实际注入的条数。"""
     from .int4_xpu_lora_loader import apply_lora, remove_lora
 
     kept, cancelled = _apply_zero_cancel(specs)
     st = applied_state(model)
     want = [_sig(s, i) for i, s in kept]
-    changed = st["dirty"] or tuple(want) != tuple(st["sigs"])
+    seen = st.get("seen")
+    if seen is None:
+        seen = st["seen"] = set()
+    # 没见过的 token = 新的一次运行或新分支：强制重新对齐（不复用上一轮挂上的 LoRA）
+    fresh = bool(token) and token not in seen
+    changed = st["dirty"] or tuple(want) != tuple(st["sigs"]) or fresh
     new_stage = _is_new_stage(st, timestep)
     if not changed and not new_stage:
         return 0
@@ -225,6 +253,8 @@ def sync(model, specs, timestep=None):
         st["detail"] = {**{k: v for k, v in st["detail"].items() if k in keep_keys},
                         **injected_detail}
         st["dirty"] = False
+        if token:
+            seen.add(token)
         if injected:
             # 重建过 LoRA 后重新武装权重预热（与加载路径一致；已在显存上的层是空操作）
             try:

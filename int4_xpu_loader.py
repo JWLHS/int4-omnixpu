@@ -330,9 +330,11 @@ def _wa4_install_lora_sync_hook(model=None):
                     patcher = getattr(self, "current_patcher", None)
                     if patcher is not None:
                         specs = lora_sets.specs_of_options(kwargs.get("transformer_options"))
+                        token = lora_sets.token_of_options(kwargs.get("transformer_options"))
                         if specs is None:
                             specs = lora_sets.specs_of(patcher)
-                        lora_sets.sync(patcher, specs, timestep=t)
+                            token = lora_sets.token_of(patcher)
+                        lora_sets.sync(patcher, specs, timestep=t, token=token)
             except Exception as e:
                 log.debug("[int4 LoRA] 规格对齐失败：%s", e)
             return _orig_apply(self, x, t, *args, **kwargs)
