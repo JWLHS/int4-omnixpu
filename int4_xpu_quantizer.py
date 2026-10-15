@@ -112,6 +112,14 @@ _EXCLUSIONS = {
 		"guidance_in", "final_layer",
 		"img_mod.lin", "txt_mod.lin", "modulation.lin",
 	],
+	"flux3": [
+		# Flux.3 Klein（f3-image-small）：3072 隐层，43 块（single_blocks 28 +
+		# content_mode_blocks 10 + txt_mode_blocks 5），q/k/v 分开不融合。
+		# 输入/时间/文本投影、调制层、输出层保持原精度（与 flux2 同一策略）；
+		# 逐块敏感性诊断做完之前，先不动任何 block。
+		"emb_in", "time_in", "ref_time_in", "txt_in",
+		"final_layer", "stream_modulations",
+	],
 	"hunyuan_video": [
 		"img_in", "txt_in", "time_in", "final_layer",
 		"vector_in", "guidance_in", "vision_in", "byt5_in",
@@ -167,6 +175,7 @@ _EXCLUSIONS = {
 
 MODEL_TYPES = [
 	"flux2 (Flux.2)", "flux (Flux.1 dev/schnell)", "sd3 (SD3 / SD3.5)",
+	"flux3 (Flux.3 Klein)",
 	"hunyuan_video (Hunyuan Video)", "hunyuan3d (Hunyuan3D 2.x)",
 	"pixart (PixArt Alpha / Sigma)", "hydit (Hunyuan DiT)",
 	"auraflow (AuraFlow)", "mochi (Mochi Preview)", "cosmos (Cosmos)",

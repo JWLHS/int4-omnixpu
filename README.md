@@ -218,6 +218,18 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
 
 ## 更新记录
 
+- 2026-10-16（Flux.3 Klein 支持 + tint4 加载 QuaRot 修复）：
+  ① 量化器新增 `flux3` 架构（`f3-image-small`，3072 隐层、43 块 = single_blocks 28 +
+  content_mode_blocks 10 + txt_mode_blocks 5，q/k/v 分开不融合），排除
+  `emb_in / time_in / ref_time_in / txt_in / final_layer / stream_modulations`，
+  其余 258 层全量量化。实测（A770 + torch 2.13，蒸馏版 10.34GiB 源 → wa4 3.12GiB /
+  tint4 3.08GiB）：加载 `Config: Flux3`、`Indexed 258 INT4 groups`、
+  `Pre-injected 258 INT4XPULinear`，文生图实跑通过。
+  ② 修复 tint4 加载的 QuaRot 键名：加载器读的是 `__tint4_xpu_quarot__`，而生态里
+  **没有任何文件写这个键**（量化器写的是 `__tint4_quarot__`，TINT4 自家 loader 也读它）
+  → "QuaRot ON 的 tint4 模型"会被静默当作未旋转（权重旋转、激活不旋转），输出必错。
+  现改为优先读 `__tint4_quarot__`、`__tint4_xpu_quarot__` 作兼容后备。验证：把标记
+  置 1 后日志出现 `TINT4 QuaRot ON (gs=128)` 与 `Config: Flux3 [QuaRot]`。
 - 2026-09-21（Qwen Image 2.1 支持）：新架构是 32 块单流（融合 `img_mlp.gate_up`、顶层共享
   adaLN），与 Qwen Image 1.0 的 60 块双流完全不同，插件三处适配：① `QwenImage21` 跳过
   omni norm —— 它的 `txt_in.text_norm` 是 `ZeroCenteredRMSNorm`（存的是 `scale-1`，实测

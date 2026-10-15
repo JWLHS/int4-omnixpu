@@ -250,6 +250,19 @@ then **our local test settings (reference only)** and why:
 
 ## Changelog
 
+- 2026-10-16 (Flux.3 Klein support + tint4 QuaRot load fix):
+  (1) the quantizer gains a `flux3` architecture (`f3-image-small`: 3072 hidden, 43 blocks =
+  28 single + 10 content-mode + 5 txt-mode, separate q/k/v). It excludes
+  `emb_in / time_in / ref_time_in / txt_in / final_layer / stream_modulations` and quantizes the
+  remaining 258 layers. Measured on A770 + torch 2.13 (10.34 GiB distilled source → wa4 3.12 GiB /
+  tint4 3.08 GiB): loads as `Config: Flux3`, `Indexed 258 INT4 groups`,
+  `Pre-injected 258 INT4XPULinear`, text-to-image verified.
+  (2) fixed the tint4 QuaRot marker key: the loader read `__tint4_xpu_quarot__`, which **no file in
+  the ecosystem writes** (the quantizer writes `__tint4_quarot__`, and the TINT4 loader reads that
+  one), so a tint4 model quantized with QuaRot ON was silently treated as un-rotated - weights
+  rotated, activations not - which cannot produce a correct image. It now reads
+  `__tint4_quarot__` first, keeping `__tint4_xpu_quarot__` as a fallback. Verified: with the marker
+  set to 1 the log reports `TINT4 QuaRot ON (gs=128)` and `Config: Flux3 [QuaRot]`.
 - 2026-09-17 (memory leak fix): repeatedly loading/switching models in one process made
   process memory climb monotonically to 89GB (65.7GB private), after which qwen OOM'd.
   Root cause: two module-level strong references kept unloaded models alive —

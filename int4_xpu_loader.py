@@ -1921,8 +1921,15 @@ class int4XPUModelLoader:
         qgs = int(sd.pop("__w4a4_quarot_group_size__", torch.tensor(128)).item()) if use_quarot else 128
         hadamard_H = None
         # ── TINT4 QuaRot 标记（与 wa4 的 Hadamard 旋转实现完全一致，直接复用）──
+        # 规范键名是量化器写出的 `__tint4_quarot__`（TINT4 自家 loader 也读它）；
+        # `__tint4_xpu_quarot__` 保留为兼容旧文件的后备键。
         try:
-            _t4_quarot = bool(sd.get("__tint4_xpu_quarot__", torch.tensor(0)).item())
+            _t4_quarot = bool(
+                sd.get(
+                    "__tint4_quarot__",
+                    sd.get("__tint4_xpu_quarot__", torch.tensor(0)),
+                ).item()
+            )
         except Exception:
             _t4_quarot = False
         if _t4_quarot:
