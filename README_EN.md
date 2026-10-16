@@ -208,6 +208,7 @@ format at w4a16:
 | Qwen-Edit | ~1.5 | ~1.5 | editing capability is equivalent in both formats |
 | Qwen-AIO | ~1.5 | ~2.1 | tint4 conversion/native path difference |
 | Z-Image Turbo | ~1.05 | ~1.06 | fastest |
+| MOSS-Image SFT | ~1.2 | ~1.2 | 30 steps at cfg=3 (two forwards per step): wa4 73.0 s / tint4 73.9 s total |
 
 (Full 20-model cold/warm comparison and per-step details are in the local
 `docs/` test records; not shipped with the repo.)
@@ -245,11 +246,27 @@ then **our local test settings (reference only)** and why:
   a4 needs ESIMD s8u4, missing ops fall back automatically; on B series,
   building the kernel from PR #629 gives w4a8, w4a4 stays A-series only.
 - WAN / LTX2 video models are deferred (INT4 precision loss is too high).
+- MOSS-Image LoRA injection is unverified (no LoRA for that model on this machine yet); quantization and text-to-image are both verified.
 - Without a kernel, fallback paths (python/torchao) are slow — availability
   fallback only.
 
 ## Changelog
 
+- 2026-10-17 (MOSS-Image support): the quantizer gains a `moss_image` architecture (OpenMOSS
+  5B base DiT, released 2026-10-16; 3072 hidden / 42 blocks, each block having fused
+  `proj.{qkv, o, ffn_up_gate, ffn_down}` Linears without bias). It excludes
+  `video_embedder / text_embedder / time_embedding / shared_block_modulation /
+  video_head_modulation / final_linear_video` and quantizes the remaining **168 layers**.
+  Measured on A770 + torch 2.13: a 9.47 GiB bf16 source becomes **wa4 2.96 GiB / tint4 2.93 GiB**;
+  per-layer quantization relative error **0.1031** (qwen2.1 0.1129 / flux3 0.1116 on the same
+  scale; lower is better). cf runs, 30 steps at cfg=3, 1024², same seed, negative branch
+  included: int8 69.8 s / wa4 73.0 s / tint4 73.9 s / bf16 80.2 s; load log shows
+  `Loading → Load complete (dtype=torch.bfloat16, backend=w4a16)` followed by
+  `onednn_int4_gemm … (M=4159 K=3072 N=9216 gs=64)` (tint4 uses `onednn_int4_gemm_torchao … gs=128`).
+  Pixel difference against bf16: mean_abs 25.4 (wa4) / 28.3 (tint4), int8 4.3 on the same setup.
+  No loader change was needed: `proj` is an `nn.ModuleDict`, and the injection side resolves
+  the parent by name and then `setattr`s, which lands in the ModuleDict's `_modules` exactly
+  like a plain `nn.Linear`.
 - 2026-10-16 (Flux.3 Klein support + tint4 QuaRot load fix):
   (1) the quantizer gains a `flux3` architecture (`f3-image-small`: 3072 hidden, 43 blocks =
   28 single + 10 content-mode + 5 txt-mode, separate q/k/v). It excludes

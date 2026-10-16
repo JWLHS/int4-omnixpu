@@ -180,6 +180,7 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
 | Qwen-Edit | ~1.5s/步 | ~1.5s/步 | 编辑能力两格式相当 |
 | Qwen-AIO | ~1.5s/步 | ~2.1s/步 | tint4 走转换/原生路径差异 |
 | Z-Image Turbo | ~1.05s/步 | ~1.06s/步 | 最快 |
+| MOSS-Image SFT | ~1.2s/步 | ~1.2s/步 | 30 步 cfg=3（每步两次前向）合计 wa4 73.0s / tint4 73.9s |
 
 （完整 20 模型冷/热对比与每步明细见本地 `docs/` 测试记录，不随仓库分发。）
 
@@ -214,10 +215,23 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
   ESIMD s8u4，缺算子自动回退；B 系列从 PR #629 分支编译 kernel 后
   w4a8 可用，w4a4 仅 A 系列。
 - WAN / LTX2 视频模型 int4 精度损失较高，暂缓适配。
+- MOSS-Image 的 LoRA 注入未验证（本地暂无该模型的 LoRA 文件）；量化与文生图已实测通过。
 - kernel 缺失时回退路径（python/torchao）慢，仅作可用性兜底。
 
 ## 更新记录
 
+- 2026-10-17（MOSS-Image 支持）：量化器新增 `moss_image` 架构（OpenMOSS 5B base DiT，
+  2026-10-16 发布；3072 隐层 / 42 块，每块 `proj.{qkv, o, ffn_up_gate, ffn_down}` 全部是
+  融合 Linear、无 bias），排除 `video_embedder / text_embedder / time_embedding /
+  shared_block_modulation / video_head_modulation / final_linear_video`，其余 **168 层**
+  全量量化。实测（A770 + torch 2.13）：bf16 9.47GiB 源 → **wa4 2.96GiB / tint4 2.93GiB**；
+  逐层量化相对误差 **0.1031**（对照 qwen2.1 0.1129 / flux3 0.1116，同口径，越低越好）。
+  cf 实跑 30 步 cfg=3 1024²（同 seed，含负分支）：int8 69.8s / wa4 73.0s / tint4 73.9s /
+  bf16 80.2s；加载日志 `Loading → Load complete (dtype=torch.bfloat16, backend=w4a16)` +
+  `onednn_int4_gemm … (M=4159 K=3072 N=9216 gs=64)`（tint4 走 `onednn_int4_gemm_torchao … gs=128`）。
+  与 bf16 对照像素差 mean_abs 25.4（wa4）/ 28.3（tint4），同口径 int8 为 4.3。
+  加载器无需改动：`proj` 是 `nn.ModuleDict`，注入侧先按名字取到 `proj` 再 `setattr`，
+  正好写进 ModuleDict 的 `_modules`，与普通 `nn.Linear` 路径一致。
 - 2026-10-16（Flux.3 Klein 支持 + tint4 加载 QuaRot 修复）：
   ① 量化器新增 `flux3` 架构（`f3-image-small`，3072 隐层、43 块 = single_blocks 28 +
   content_mode_blocks 10 + txt_mode_blocks 5，q/k/v 分开不融合），排除
