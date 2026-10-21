@@ -181,6 +181,7 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
 | Qwen-AIO | ~1.5s/步 | ~2.1s/步 | tint4 走转换/原生路径差异 |
 | Z-Image Turbo | ~1.05s/步 | ~1.06s/步 | 最快 |
 | MOSS-Image SFT | ~1.2s/步 | ~1.2s/步 | 30 步 cfg=3（每步两次前向）合计 wa4 73.0s / tint4 73.9s |
+| Fibo 2.0 Dev / Edit Turbo | ~3.3s/步 | ~3.3s/步 | 编辑 20 步 cfg=3 合计 wa4 65.8s / tint4 65.7s（Turbo 4 步 cfg=1 另计） |
 
 （完整 20 模型冷/热对比与每步明细见本地 `docs/` 测试记录，不随仓库分发。）
 
@@ -220,6 +221,20 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
 
 ## 更新记录
 
+- 2026-10-22（Fibo 2.0 支持）：① 量化器新增 `fibo2` 架构（Bria，8.226B 单流 DiT，
+  3584 隐层 / 44 主块 + 2 个 noise_refiner，FFN 是融合的 `w13`（w1+w3，走 SwiGLU），
+  第 6/14/22/30/38 层带 cross-attention 注入）。排除 `x_embedder / t_embedder /
+  final_layer / adaLN_modulation / perceiver`，其余 **199 层**量化（主块 176 + refiner 8 +
+  注入层 cross-attn 15）。实测（A770 + torch 2.13，15.32GiB bf16 源）：**wa4 4.96GiB /
+  tint4 4.90GiB**，Dev 与 Edit Turbo 各一份。
+  ② 加载器修复两处检测锚点：`perceiver.latent_queries` 与 `layers.N.cross_attn_gate`
+  都不带 `.weight` 后缀，原 `clean_sd` 过滤器会把它们丢掉 —— 前者导致
+  `Architecture detection failed`，后者让 `injection_layers` 算成空 → context 不按 6 段切分
+  → `mat1 and mat2 shapes cannot be multiplied (17x46080 and 7680x7168)`。
+  ③ cf 实测（同一张参考图、seed 64）：Turbo 编辑 4 步 cfg=1 → int8 20.2s / wa4 20.1s /
+  tint4 10.1s（tint4 那次文本编码器已缓存，不能与冷启直接比）；Dev 编辑 20 步 cfg=3 →
+  int8 70.6s / wa4 65.8s / tint4 65.7s。与 int8 的像素差 mean_abs：Turbo 18.5（wa4）/
+  17.3（tint4），Dev 13.9 / 11.6。
 - 2026-10-17（MOSS-Image 支持）：量化器新增 `moss_image` 架构（OpenMOSS 5B base DiT，
   2026-10-16 发布；3072 隐层 / 42 块，每块 `proj.{qkv, o, ffn_up_gate, ffn_down}` 全部是
   融合 Linear、无 bias），排除 `video_embedder / text_embedder / time_embedding /

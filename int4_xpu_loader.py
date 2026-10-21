@@ -2039,11 +2039,16 @@ class int4XPUModelLoader:
         import comfy.model_detection as md
         # 检测锚点键必须保留：ComfyUI 新版用它们区分架构（缺 cap_pad_token 会把
         # Z-Image 判成 MingImage），过滤掉就会构建错模型。
+        # Fibo 2.0 的锚点是 `perceiver.latent_queries` 与 `layers.N.cross_attn_gate`
+        # （都不带 .weight/.bias 后缀）：前者丢了直接 "Architecture detection failed"，
+        # 后者丢了 injection_layers 会被算成空 → context 不按 6 段切分，perceiver
+        # 的 to_kv 收到 46080 宽输入 → "mat1 and mat2 shapes cannot be multiplied"。
         clean_sd = {k: v for k, v in sd.items()
                     if k.endswith((".weight", ".bias", ".scale"))
                     or k.startswith(("text_encoders.", "vae."))
                     or k.endswith(("cap_pad_token", "__ming_image__",
-                                   "__index_timestep_zero__", "rope.inv_freq"))}
+                                   "__index_timestep_zero__", "rope.inv_freq",
+                                   "perceiver.latent_queries", "cross_attn_gate"))}
         prefix = md.unet_prefix_from_state_dict(clean_sd)
         tsd = comfy.utils.state_dict_prefix_replace(clean_sd, {prefix: ""}, filter_keys=True)
         cfg = md.model_config_from_unet(tsd if len(tsd) > 0 else clean_sd, "")

@@ -209,6 +209,7 @@ format at w4a16:
 | Qwen-AIO | ~1.5 | ~2.1 | tint4 conversion/native path difference |
 | Z-Image Turbo | ~1.05 | ~1.06 | fastest |
 | MOSS-Image SFT | ~1.2 | ~1.2 | 30 steps at cfg=3 (two forwards per step): wa4 73.0 s / tint4 73.9 s total |
+| Fibo 2.0 Dev / Edit Turbo | ~3.3 | ~3.3 | editing, 20 steps at cfg=3: wa4 65.8 s / tint4 65.7 s total (Turbo runs 4 steps at cfg=1) |
 
 (Full 20-model cold/warm comparison and per-step details are in the local
 `docs/` test records; not shipped with the repo.)
@@ -252,6 +253,22 @@ then **our local test settings (reference only)** and why:
 
 ## Changelog
 
+- 2026-10-22 (Fibo 2.0 support): (1) the quantizer gains a `fibo2` architecture (Bria,
+  8.226B single-stream DiT: 3584 hidden, 44 main blocks + 2 noise_refiner blocks, fused
+  `w13` SwiGLU FFN, cross-attention injected at layers 6/14/22/30/38). It excludes
+  `x_embedder / t_embedder / final_layer / adaLN_modulation / perceiver` and quantizes the
+  remaining **199 layers** (176 main + 8 refiner + 15 injection cross-attn). Measured on
+  A770 + torch 2.13 from a 15.32 GiB bf16 source: **wa4 4.96 GiB / tint4 4.90 GiB**, one file
+  per variant for Dev and Edit Turbo.
+  (2) The loader now keeps two detection anchors that have no `.weight` suffix:
+  `perceiver.latent_queries` (without it: `Architecture detection failed`) and
+  `layers.N.cross_attn_gate` (without it `injection_layers` is empty, the context is not
+  split into 6 bundles and the perceiver's `to_kv` gets a 46080-wide input →
+  `mat1 and mat2 shapes cannot be multiplied (17x46080 and 7680x7168)`).
+  (3) cf runs, same reference image and seed 64: Turbo edit 4 steps at cfg=1 → int8 20.2 s /
+  wa4 20.1 s / tint4 10.1 s (the tint4 run reused a cached text encoder, not a cold start);
+  Dev edit 20 steps at cfg=3 → int8 70.6 s / wa4 65.8 s / tint4 65.7 s. Pixel difference vs
+  int8 (mean_abs): Turbo 18.5 (wa4) / 17.3 (tint4), Dev 13.9 / 11.6.
 - 2026-10-17 (MOSS-Image support): the quantizer gains a `moss_image` architecture (OpenMOSS
   5B base DiT, released 2026-10-16; 3072 hidden / 42 blocks, each block having fused
   `proj.{qkv, o, ffn_up_gate, ffn_down}` Linears without bias). It excludes

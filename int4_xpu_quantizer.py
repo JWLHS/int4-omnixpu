@@ -179,6 +179,15 @@ _EXCLUSIONS = {
 		"video_embedder", "text_embedder", "time_embedding",
 		"shared_block_modulation", "video_head_modulation", "final_linear_video",
 	],
+	"fibo2": [
+		# Fibo 2.0（Bria，8.2B 单流 DiT，2026-10-20 发布）：3584 隐层 / 44 主块 +
+		# 2 个 noise_refiner，每块 attention.{qkv,out} + feed_forward.{w13,w2}
+		#（w13 是融合的 w1+w3，走 comfy.ops.linear_input_act swiglu）。
+		# 5 个注入层（6/14/22/30/38）自带的 cross_attention 与主块一起量化；
+		# 文本/图像侧的 perceiver（512 latents + 2 层，约 0.48B）、x/t embedding、
+		# adaLN 调制与 final_layer 保持原精度（与 flux2/flux3/moss 同一策略）。
+		"x_embedder", "t_embedder", "final_layer", "adaLN_modulation", "perceiver",
+	],
 	"auto": [],
 }
 
@@ -197,6 +206,7 @@ MODEL_TYPES = [
 	"anima (Anima / Cosmos Predict2)", "auto (Auto-detect)",
 	"h3 (MiniMax H3)",
 	"moss_image (MOSS-Image)",
+	"fibo2 (Fibo 2.0)",
 ]
 
 
