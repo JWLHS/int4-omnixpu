@@ -9,6 +9,7 @@ v1.0（正式版首发）：
 """
 import gc, os, time, types, torch, torch.nn as nn, torch.nn.functional as F, comfy.ops, comfy.utils
 import comfy.model_detection, comfy.sd, folder_paths, logging
+from safetensors import safe_open
 
 log = logging.getLogger("int4")
 
@@ -1894,7 +1895,14 @@ class int4XPUModelLoader:
         _LOAD_T0 = time.time() if _TIMING else 0.0
         _t = _tphase("load_model enter")
         _ram_trace("load start")
-        sd = comfy.utils.load_torch_file(folder_paths.get_full_path("diffusion_models", unet_name), safe_load=True)
+        unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
+        sd = comfy.utils.load_torch_file(unet_path, safe_load=True)
+        source_metadata = {}
+        try:
+            with safe_open(unet_path, framework="pt") as src:
+                source_metadata = src.metadata() or {}
+        except Exception:
+            pass
         _t = _tphase("load_torch_file done", _t)
         _ram_trace("load_torch_file done")
         log.info("[int4] Loading: %s", unet_name)
@@ -2048,10 +2056,14 @@ class int4XPUModelLoader:
                     or k.startswith(("text_encoders.", "vae."))
                     or k.endswith(("cap_pad_token", "__ming_image__",
                                    "__index_timestep_zero__", "rope.inv_freq",
-                                   "perceiver.latent_queries", "cross_attn_gate"))}
+                                   "perceiver.latent_queries", "cross_attn_gate",
+                                   "adaln_t_table"))}
         prefix = md.unet_prefix_from_state_dict(clean_sd)
         tsd = comfy.utils.state_dict_prefix_replace(clean_sd, {prefix: ""}, filter_keys=True)
-        cfg = md.model_config_from_unet(tsd if len(tsd) > 0 else clean_sd, "")
+        cfg = md.model_config_from_unet(
+            tsd if len(tsd) > 0 else clean_sd, "",
+            metadata=source_metadata,
+        )
         cfg_type = type(cfg).__name__ if cfg else "UNKNOWN"
         # ── Qwen-Image-Edit 参考方式标记 ──
         # clean_sd 过滤把 __index_timestep_zero__ 标记键滤掉了，comfy 检测
@@ -2094,7 +2106,7 @@ class int4XPUModelLoader:
                 sd, model_options={
                     "custom_operations": comfy.ops.disable_weight_init,
                     "dtype": act_dtype,
-                })
+                }, metadata=source_metadata)
         finally:
             cfg.get_model = _o2; md.model_config_from_unet = _o1
         _t = _tphase("model built", _t)

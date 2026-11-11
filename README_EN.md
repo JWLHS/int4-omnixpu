@@ -210,6 +210,7 @@ format at w4a16:
 | Z-Image Turbo | ~1.05 | ~1.06 | fastest |
 | MOSS-Image SFT | ~1.2 | ~1.2 | 30 steps at cfg=3 (two forwards per step): wa4 73.0 s / tint4 73.9 s total |
 | Fibo 2.0 Dev / Edit Turbo | ~3.3 | ~3.3 | editing, 20 steps at cfg=3: wa4 65.8 s / tint4 65.7 s total (Turbo runs 4 steps at cfg=1) |
+| MiniMax H3 Image | ~0.65 | ~0.64 | 1024², 6-step PDD; first step including compilation is ~10.5 s; both T2I and reference-image editing pass |
 
 (Full 20-model cold/warm comparison and per-step details are in the local
 `docs/` test records; not shipped with the repo.)
@@ -248,11 +249,21 @@ then **our local test settings (reference only)** and why:
   building the kernel from PR #629 gives w4a8, w4a4 stays A-series only.
 - WAN / LTX2 video models are deferred (INT4 precision loss is too high).
 - MOSS-Image LoRA injection is unverified (no LoRA for that model on this machine yet); quantization and text-to-image are both verified.
+- MiniMax H3 Image LoRA is not verified yet; text-to-image, reference-image editing, and loading TINT4 through int4XPUModelLoader are verified.
 - Without a kernel, fallback paths (python/torchao) are slow — availability
   fallback only.
 
 ## Changelog
 
+- 2026-11-11 (MiniMax H3 Image support): the quantizer gains the `h3_image`
+  architecture (50 main blocks without the audio stream). Only the four main
+  linears in each block (`qkv_proj / out_proj / fc1 / fc2`, **200 layers**) are
+  quantized; `condition_proj / token_refiner / final_layer / video_patch_proj`
+  and the 8-wide `adaln_proj` remain at source precision. Both WA4/TINT4
+  quantizers, both loaders, and architecture detection were updated. A 40.23
+  GiB bf16 source produces **WA4 11.12 GiB / TINT4 10.98 GiB**. CF passed
+  1024² six-step PDD text-to-image and reference-image editing for both formats;
+  the TINT4 file also loads directly through `int4XPUModelLoader`.
 - 2026-10-22 (Fibo 2.0 support): (1) the quantizer gains a `fibo2` architecture (Bria,
   8.226B single-stream DiT: 3584 hidden, 44 main blocks + 2 noise_refiner blocks, fused
   `w13` SwiGLU FFN, cross-attention injected at layers 6/14/22/30/38). It excludes

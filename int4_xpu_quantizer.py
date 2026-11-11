@@ -13,6 +13,7 @@ import torch
 import logging
 import folder_paths
 import comfy.utils
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 log = logging.getLogger("int4")
@@ -170,6 +171,15 @@ _EXCLUSIONS = {
 		"video_patch_proj", "audio_patch_proj",
 		"condition_proj", "final_layer", "time_embedder", "time_embed",
 	],
+	"h3_image": [
+		# MiniMax-H3-Image has the same 50-block H3 DiT without the audio
+		# stream. Quantize the 200 main block linears only. Keep the text
+		# connector/refiner, input/output projections, and the curve-based
+		# adaLN (8-wide input, incompatible with the INT4 group sizes).
+		"video_patch_proj", "condition_proj", "token_refiner",
+		"final_layer", "adaln_t_table", "adaln_proj",
+		"time_embedder", "time_embed",
+	],
 	"moss_image": [
 		# MOSS-Image（OpenMOSS 5B base DiT，2026-10-16 发布）：3072 隐层 / 42 块，
 		# 每块 proj.{qkv, o, ffn_up_gate, ffn_down} 全部融合 Linear、无 bias。
@@ -205,6 +215,7 @@ MODEL_TYPES = [
 	"boogu (Boogu)", "krea2 (Krea 2)", "ideogram4 (Ideogram 4)",
 	"anima (Anima / Cosmos Predict2)", "auto (Auto-detect)",
 	"h3 (MiniMax H3)",
+	"h3_image (MiniMax H3 Image)",
 	"moss_image (MOSS-Image)",
 	"fibo2 (Fibo 2.0)",
 ]
@@ -294,6 +305,12 @@ class int4XPUModelQuantizer:
 		model_type = model_type_key(model_type)
 		unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
 		sd = comfy.utils.load_torch_file(unet_path, safe_load=True)
+		source_metadata = {}
+		try:
+			with safe_open(unet_path, framework="pt") as src:
+				source_metadata = src.metadata() or {}
+		except Exception:
+			pass
 
 		# ── 剥离嵌入的 VAE / 文本编码器（特征过滤，兼容 AIO 融合键名）──
 		stripped = 0
@@ -376,7 +393,9 @@ class int4XPUModelQuantizer:
 			output_sd["__w4a4_quarot_group_size__"] = torch.tensor(quarot_group_size, dtype=torch.int32)
 
 		dst = os.path.join(folder_paths.get_output_directory(), f"{output_filename}.safetensors")
-		save_file(output_sd, dst)
+		# H3 Image carries its PDD sigma grid in the safetensors metadata.
+		# Losing this metadata builds the wrong output-head/sampling config.
+		save_file(output_sd, dst, metadata=source_metadata or None)
 		log.info("[int4] Saved: %s | %d quantized | QuaRot=%s | dtype=%s",
 				 dst, quant_count, "ON" if qa else "OFF", weight_dtype)
 		return ()

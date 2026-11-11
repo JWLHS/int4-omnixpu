@@ -182,6 +182,7 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
 | Z-Image Turbo | ~1.05s/步 | ~1.06s/步 | 最快 |
 | MOSS-Image SFT | ~1.2s/步 | ~1.2s/步 | 30 步 cfg=3（每步两次前向）合计 wa4 73.0s / tint4 73.9s |
 | Fibo 2.0 Dev / Edit Turbo | ~3.3s/步 | ~3.3s/步 | 编辑 20 步 cfg=3 合计 wa4 65.8s / tint4 65.7s（Turbo 4 步 cfg=1 另计） |
+| MiniMax H3 Image | ~0.65s/步 | ~0.64s/步 | 1024²、6 步 PDD；首步含编译约 10.5s，编辑路径双格式均通过 |
 
 （完整 20 模型冷/热对比与每步明细见本地 `docs/` 测试记录，不随仓库分发。）
 
@@ -217,10 +218,18 @@ kernel，但保证可用、不中断；LoRA 在 kernel 与回退路径下都生�
   w4a8 可用，w4a4 仅 A 系列。
 - WAN / LTX2 视频模型 int4 精度损失较高，暂缓适配。
 - MOSS-Image 的 LoRA 注入未验证（本地暂无该模型的 LoRA 文件）；量化与文生图已实测通过。
+- MiniMax H3 Image 的 LoRA 尚未验证；文生图、参考图编辑、int4XPU 加载 tint4 均已实测通过。
 - kernel 缺失时回退路径（python/torchao）慢，仅作可用性兜底。
 
 ## 更新记录
 
+- 2026-11-11（MiniMax H3 Image 支持）：量化器新增 `h3_image` 架构（50 个主 block、
+  无 audio stream）。只量化每块 `qkv_proj / out_proj / fc1 / fc2` 共 **200 层**；
+  `condition_proj / token_refiner / final_layer / video_patch_proj` 与 8 维
+  `adaln_proj` 保持原精度。WA4 与 TINT4 的量化器、两套加载器及架构检测均已更新。
+  40.23GiB bf16 源生成为 **WA4 11.12GiB / TINT4 10.98GiB**。CF 实跑 1024²、
+  6 步 PDD 的文生图和参考图编辑均成功；TINT4 文件也验证可由 `int4XPUModelLoader`
+  直接加载。
 - 2026-10-22（Fibo 2.0 支持）：① 量化器新增 `fibo2` 架构（Bria，8.226B 单流 DiT，
   3584 隐层 / 44 主块 + 2 个 noise_refiner，FFN 是融合的 `w13`（w1+w3，走 SwiGLU），
   第 6/14/22/30/38 层带 cross-attention 注入）。排除 `x_embedder / t_embedder /
